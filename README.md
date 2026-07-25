@@ -2,7 +2,7 @@
 
 The PII Ingestor Worker's source -- one of three services a
 [chameleon-installer](https://github.com/BrechtVanBuggenhout/chameleon-installer)
-BYOC deployment runs (alongside `chameleon-key-vault` and
+BYOC deployment runs (alongside `chameleon-vault` and
 `chameleon-console`). Most customers don't need this repo at all:
 `bootstrap.sh` pulls Chameleon's pre-built image by default. Build from
 here yourself only if you want to run entirely independent of
