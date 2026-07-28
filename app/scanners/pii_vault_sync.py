@@ -56,6 +56,14 @@ class PiiVaultSyncJob:
     """
 
     VAULT_TABLE_ID = "pii_vault"
+    # A first sync of an existing table processes every one of its rows --
+    # for a real production user table that can be a lot of rows. Chunking
+    # keeps peak memory bounded to one chunk's worth of rows/contexts/output
+    # records regardless of table size, instead of materializing the entire
+    # result set (a real OOM hit a real customer: usage scaled almost
+    # exactly with whatever memory limit was configured, the signature of
+    # an all-at-once accumulation, not a fixed per-request cost).
+    CHUNK_SIZE = 500
 
     def __init__(
         self,
@@ -115,7 +123,24 @@ WHERE {resource.user_id_column} IS NOT NULL
         job_config = bigquery.QueryJobConfig(
             query_parameters=[bigquery.ScalarQueryParameter("resource_id", "STRING", resource.id)]
         )
-        rows = list(self.bigquery_client.query(query, job_config=job_config).result())
+        # Deliberately NOT wrapped in list(...) -- iterating the RowIterator
+        # directly lets the BigQuery client page results in from the API as
+        # we go, instead of downloading and holding the entire table in
+        # memory before processing a single row.
+        row_iterator = self.bigquery_client.query(query, job_config=job_config).result()
+
+        total_synced = 0
+        chunk: List[Any] = []
+        for row in row_iterator:
+            chunk.append(row)
+            if len(chunk) >= self.CHUNK_SIZE:
+                total_synced += self._sync_chunk(resource, encrypt_fields, chunk)
+                chunk = []
+        total_synced += self._sync_chunk(resource, encrypt_fields, chunk)
+
+        return total_synced
+
+    def _sync_chunk(self, resource: RegistryResource, encrypt_fields: List[Any], rows: List[Any]) -> int:
         if not rows:
             return 0
 
