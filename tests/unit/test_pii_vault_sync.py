@@ -54,10 +54,14 @@ class FakeVault:
     def __init__(self, registry_resources, contexts):
         self._registry_resources = registry_resources
         self._contexts = contexts
+        self.create_keys_calls: list[list[str]] = []
 
     def fetch_pii_registry_resources(self, owner_connector=None):
         assert owner_connector == "manual"
         return {"resources": self._registry_resources}
+
+    def batch_create_keys(self, user_ids):
+        self.create_keys_calls.append(list(user_ids))
 
     def batch_get_encryption_contexts(self, user_ids):
         return {uid: self._contexts[uid] for uid in user_ids if uid in self._contexts}
@@ -126,6 +130,15 @@ class TestPiiVaultSyncJob:
         assert results[0].resource_id == "bigquery:proj.dataset.federated_user"
         assert results[0].users_synced == 2
         assert results[0].error is None
+
+        # These are pre-existing users who've never been through Chameleon's
+        # ingestion pipeline -- they have no key yet, so a key must be created
+        # for them before fetching an encryption context, same as the real
+        # ingestion pipeline already does. Regression test for exactly the
+        # bug that shipped: this call was missing entirely, which meant a
+        # real customer's first sync attempt hung for minutes against Key
+        # Vault repeatedly failing to find a context for a keyless user.
+        assert vault.create_keys_calls == [["u1", "u2"]]
 
         # Query correctly scoped to this resource, excluding already-vaulted users
         assert "resource_id" in bq.queries[0]
