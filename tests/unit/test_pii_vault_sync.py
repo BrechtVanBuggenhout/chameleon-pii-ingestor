@@ -33,8 +33,9 @@ class FakeBigQueryClient:
     def __init__(self, source_rows):
         self.source_rows = [FakeRow(r) for r in source_rows]
         self.queries = []
-        self.loaded_records = None
-        self.loaded_table_ref = None
+        # Accumulated across every load_table_from_json call, since a large
+        # sync now issues one per chunk rather than a single call at the end.
+        self.load_calls: list[tuple[list, str]] = []
 
     def query(self, query, job_config=None):
         self.queries.append(query)
@@ -42,10 +43,19 @@ class FakeBigQueryClient:
 
     def load_table_from_json(self, records, table_ref, job_config=None):
         def on_load():
-            self.loaded_records = records
-            self.loaded_table_ref = table_ref
+            self.load_calls.append((records, table_ref))
 
         return FakeLoadJob(on_load)
+
+    @property
+    def loaded_records(self):
+        """All records across every chunk load, flattened -- convenience for
+        tests that don't care about chunk boundaries."""
+        return [r for records, _ in self.load_calls for r in records]
+
+    @property
+    def loaded_table_ref(self):
+        return self.load_calls[-1][1] if self.load_calls else None
 
 
 class FakeVault:
@@ -166,7 +176,34 @@ class TestPiiVaultSyncJob:
         results = job.sync_all()
 
         assert results[0].users_synced == 0
-        assert bq.loaded_records is None
+        assert bq.loaded_records == []
+
+    def test_chunks_large_syncs_instead_of_loading_everything_at_once(self):
+        # Regression test for a real OOM: memory usage scaled almost exactly
+        # with whatever limit was configured (530MB/512MB, then 1025MB/1GB),
+        # the signature of materializing the entire result set at once
+        # rather than a fixed per-request cost. 1250 rows spans 3 chunks at
+        # CHUNK_SIZE=500 (500 + 500 + 250).
+        row_count = 1250
+        source_rows = [{"user_id": f"u{i}", "tenant_id": "acme", "email": f"u{i}@example.com"} for i in range(row_count)]
+        contexts = {f"u{i}": make_context(f"v{i}") for i in range(row_count)}
+        vault = FakeVault([MANUAL_RESOURCE], contexts)
+        bq = FakeBigQueryClient(source_rows)
+        job = PiiVaultSyncJob(bq, vault, "proj", "chameleon")
+
+        results = job.sync_all()
+
+        assert results[0].users_synced == row_count
+        assert len(bq.loaded_records) == row_count
+        assert {r["user_id"] for r in bq.loaded_records} == {f"u{i}" for i in range(row_count)}
+
+        # Three separate load calls (one per chunk), not one giant call --
+        # this is what actually keeps peak memory bounded.
+        assert len(bq.load_calls) == 3
+        assert [len(records) for records, _ in bq.load_calls] == [500, 500, 250]
+
+        # Keys/contexts were also fetched per-chunk, not all 1250 at once.
+        assert [len(ids) for ids in vault.create_keys_calls] == [500, 500, 250]
 
     def test_continues_past_a_failing_resource(self):
         bad_resource = {**MANUAL_RESOURCE, "resourceId": "not-a-real-id"}
