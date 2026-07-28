@@ -120,6 +120,12 @@ WHERE {resource.user_id_column} IS NOT NULL
             return 0
 
         user_ids = [str(row[resource.user_id_column]) for row in rows]
+        # These are pre-existing users who've never been through Chameleon's
+        # ingestion pipeline, so they have no key yet -- batch_create_keys is
+        # a no-op for anyone who already has one (same as ingestion.py's real
+        # ingestion path), but is required here, unlike there, since it can
+        # never be assumed to have already happened for this table.
+        self.vault.batch_create_keys(user_ids)
         contexts = self.vault.batch_get_encryption_contexts(user_ids)
 
         now_iso = datetime.now(timezone.utc).isoformat()
