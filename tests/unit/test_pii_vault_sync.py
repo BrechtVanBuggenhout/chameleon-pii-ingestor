@@ -1,5 +1,4 @@
 import base64
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -30,8 +29,12 @@ class FakeLoadJob:
 
 
 class FakeBigQueryClient:
-    def __init__(self, source_rows):
+    def __init__(self, source_rows, existing_vault_rows=None):
         self.source_rows = [FakeRow(r) for r in source_rows]
+        # Rows already sitting in pii_vault before this sync run, as
+        # {"user_id": ..., "field_name": ...} -- used to answer the
+        # per-chunk "which fields does this user already have" lookup.
+        self.existing_vault_rows = [FakeRow(r) for r in (existing_vault_rows or [])]
         self.queries = []
         # Accumulated across every load_table_from_json call, since a large
         # sync now issues one per chunk rather than a single call at the end.
@@ -39,6 +42,12 @@ class FakeBigQueryClient:
 
     def query(self, query, job_config=None):
         self.queries.append(query)
+        # The only query that ever targets pii_vault itself is the per-chunk
+        # existing-fields lookup -- the source-table select never mentions
+        # it. That's a reliable enough signal to route the fake without
+        # needing to parse bind parameters.
+        if "pii_vault" in query:
+            return FakeQueryJob(self.existing_vault_rows)
         return FakeQueryJob(self.source_rows)
 
     def load_table_from_json(self, records, table_ref, job_config=None):
@@ -150,22 +159,75 @@ class TestPiiVaultSyncJob:
         # Vault repeatedly failing to find a context for a keyless user.
         assert vault.create_keys_calls == [["u1", "u2"]]
 
-        # Query correctly scoped to this resource, excluding already-vaulted users
-        assert "resource_id" in bq.queries[0]
+        # Source-table query is scoped to the right table, with no vault
+        # exclusion baked in (that diff now happens per chunk instead).
         assert "federated_user" in bq.queries[0]
+        assert "pii_vault" not in bq.queries[0]
+        # The per-chunk existing-fields lookup is scoped to this resource.
+        assert "pii_vault" in bq.queries[1]
+        assert "resource_id" in bq.queries[1]
 
-        # Loaded into the right table, one row per new user, only ENCRYPT fields present
+        # Loaded into the right table, one row per (user, field) -- only
+        # ENCRYPT fields present, HASH_SURROGATE (username) excluded.
         assert bq.loaded_table_ref == "proj.chameleon.pii_vault"
         assert len(bq.loaded_records) == 2
         record = next(r for r in bq.loaded_records if r["user_id"] == "u1")
         assert record["tenant_id"] == "acme"
         assert record["resource_id"] == "bigquery:proj.dataset.federated_user"
         assert record["key_id"] == "v1"
-        assert len(record["pii_fields"]) == 1  # username (HASH_SURROGATE) excluded
-        assert record["pii_fields"][0]["field_name"] == "email"
+        assert record["field_name"] == "email"
         # encrypted_value must be a base64 string (JSON-safe for load_table_from_json), not raw bytes
-        assert isinstance(record["pii_fields"][0]["encrypted_value"], str)
-        base64.b64decode(record["pii_fields"][0]["encrypted_value"])  # doesn't raise
+        assert isinstance(record["encrypted_value"], str)
+        base64.b64decode(record["encrypted_value"])  # doesn't raise
+        assert "pii_fields" not in record  # flat schema, not the old nested array
+
+    def test_backfills_only_missing_fields_for_a_partially_synced_user(self):
+        # The whole point of the flattened schema: a user who already has
+        # `email` synced from a prior run, once `first_name` gets declared
+        # later, should only get `first_name` appended -- never a duplicate
+        # `email` row, and never skipped just because they're "already in
+        # the vault" for this resource.
+        resource = {
+            **MANUAL_RESOURCE,
+            "piiFields": [
+                {"name": "email", "classification": "DIRECT_IDENTIFIER", "handling": "ENCRYPT"},
+                {"name": "first_name", "classification": "DIRECT_IDENTIFIER", "handling": "ENCRYPT"},
+            ],
+        }
+        source_rows = [
+            {"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com", "first_name": "Alex"},
+        ]
+        vault = FakeVault([resource], {"u1": make_context("v2")})
+        bq = FakeBigQueryClient(
+            source_rows,
+            existing_vault_rows=[{"user_id": "u1", "field_name": "email"}],
+        )
+        job = PiiVaultSyncJob(bq, vault, "proj", "chameleon")
+
+        results = job.sync_all()
+
+        assert results[0].users_synced == 1
+        assert len(bq.loaded_records) == 1
+        record = bq.loaded_records[0]
+        assert record["user_id"] == "u1"
+        assert record["field_name"] == "first_name"  # only the missing field, not email again
+
+    def test_skips_users_with_no_missing_fields_entirely(self):
+        # A user who already has every currently-declared field synced needs
+        # no Vault round-trip at all, not just no new rows.
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
+        vault = FakeVault([MANUAL_RESOURCE], {"u1": make_context()})
+        bq = FakeBigQueryClient(
+            source_rows,
+            existing_vault_rows=[{"user_id": "u1", "field_name": "email"}],
+        )
+        job = PiiVaultSyncJob(bq, vault, "proj", "chameleon")
+
+        results = job.sync_all()
+
+        assert results[0].users_synced == 0
+        assert bq.loaded_records == []
+        assert vault.create_keys_calls == []  # skipped before any Vault call
 
     def test_skips_users_missing_an_encryption_context(self):
         source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
