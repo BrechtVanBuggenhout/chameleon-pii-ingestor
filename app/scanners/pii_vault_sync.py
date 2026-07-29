@@ -63,7 +63,15 @@ class PiiVaultSyncJob:
     # result set (a real OOM hit a real customer: usage scaled almost
     # exactly with whatever memory limit was configured, the signature of
     # an all-at-once accumulation, not a fixed per-request cost).
-    CHUNK_SIZE = 500
+    #
+    # Lowered from 500 -> 100: chunking alone didn't stop OOMs against real
+    # data (this worker's own baseline footprint -- FastAPI + pandas + every
+    # google-cloud-* client loaded at startup -- sits close to whatever
+    # memory limit is configured, so even a 500-row chunk's transient
+    # overhead was enough to tip it over). Paired with a memory bump on the
+    # infra side; smaller chunks reduce the peak this code adds on top of
+    # that fixed baseline, independent of how generous the limit is.
+    CHUNK_SIZE = 100
 
     def __init__(
         self,
