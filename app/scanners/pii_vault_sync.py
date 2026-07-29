@@ -4,7 +4,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from google.cloud import bigquery
 
@@ -36,10 +36,18 @@ class PiiVaultSyncJob:
     Daily backfill/sync of manually-declared resources into the central
     pii_vault table -- retroactive protection for tables a customer already
     owns, that were never going to flow through Chameleon's own ingestion
-    pipeline. For each such resource: finds user IDs present in the source
-    table but not yet in the vault, encrypts their declared ENCRYPT-handling
-    fields, and inserts them. Never touches the source table itself -- no
-    redaction here, that's a separate, later, opt-in decision.
+    pipeline. For each such resource: finds which declared ENCRYPT fields
+    are still missing per user, encrypts only those, and appends them.
+
+    pii_vault is flat -- one row per (tenant_id, user_id, resource_id,
+    field_name), that's the natural unique key, not one row per user with a
+    nested field array -- so the "already synced" check is scoped per field,
+    not per user. This matters because declaring a new field on an
+    already-synced resource (e.g. adding `first_name` a week after `email`
+    was first declared) correctly backfills just that new field for every
+    existing user on the next run, without ever re-touching or duplicating
+    fields they already have. A user missing some of their declared fields
+    simply gets the missing ones appended as new rows.
 
     Encryption reuses the exact same per-user DEK + local AES-GCM +
     HMAC-token pattern as the real ingestion pipeline (see
@@ -48,11 +56,11 @@ class PiiVaultSyncJob:
     through normal ingestion, and shredding a user's key makes both
     equally unreadable.
 
-    Deliberately only detects NET-NEW user IDs via a NOT IN check, not
-    updates to an existing user's already-vaulted values (e.g. their email
-    changing in the source table) -- a known, named limitation for this
-    pass, not a silently swallowed gap. Handling in-place updates would
-    need a second mechanism if it turns out to matter.
+    Deliberately only detects fields that have never been synced for a
+    user, not changes to a field already synced (e.g. their email changing
+    in the source table) -- a known, named limitation for this pass, not a
+    silently swallowed gap. Handling in-place updates would need a second
+    mechanism if it turns out to matter.
     """
 
     VAULT_TABLE_ID = "pii_vault"
@@ -118,24 +126,22 @@ class PiiVaultSyncJob:
             [resource.user_id_column] + field_names + ([resource.tenant_id_column] if resource.tenant_id_column else [])
         )
 
+        # No "already synced" exclusion here -- pii_vault is scoped per
+        # field now, so whether a user needs any work at all depends on
+        # *which* fields they're missing, not just whether they appear in
+        # the vault anywhere. That diff happens per chunk in _sync_chunk,
+        # scoped to just that chunk's user_ids, instead of one blanket
+        # subquery against the whole vault table up front.
         query = f"""
 SELECT {select_cols}
 FROM `{project_id}.{dataset_id}.{table_id}`
 WHERE {resource.user_id_column} IS NOT NULL
-  AND CAST({resource.user_id_column} AS STRING) NOT IN (
-    SELECT user_id
-    FROM `{self.vault_project_id}.{self.vault_dataset_id}.{self.VAULT_TABLE_ID}`
-    WHERE resource_id = @resource_id
-  )
 """
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("resource_id", "STRING", resource.id)]
-        )
         # Deliberately NOT wrapped in list(...) -- iterating the RowIterator
         # directly lets the BigQuery client page results in from the API as
         # we go, instead of downloading and holding the entire table in
         # memory before processing a single row.
-        row_iterator = self.bigquery_client.query(query, job_config=job_config).result()
+        row_iterator = self.bigquery_client.query(query).result()
 
         total_synced = 0
         chunk: List[Any] = []
@@ -153,17 +159,37 @@ WHERE {resource.user_id_column} IS NOT NULL
             return 0
 
         user_ids = [str(row[resource.user_id_column]) for row in rows]
+        existing_fields_by_user = self._fetch_existing_fields(resource.id, user_ids)
+
+        # Only users missing at least one declared field need a key/context
+        # at all -- skip fully-synced users entirely rather than spending a
+        # Vault round-trip just to confirm we already have everything.
+        rows_needing_work: List[Any] = []
+        missing_fields_by_user: Dict[str, List[Any]] = {}
+        for row in rows:
+            user_id = str(row[resource.user_id_column])
+            already_synced = existing_fields_by_user.get(user_id, set())
+            missing = [c for c in encrypt_fields if c.name not in already_synced]
+            if missing:
+                rows_needing_work.append(row)
+                missing_fields_by_user[user_id] = missing
+
+        if not rows_needing_work:
+            return 0
+
+        work_user_ids = [str(row[resource.user_id_column]) for row in rows_needing_work]
         # These are pre-existing users who've never been through Chameleon's
         # ingestion pipeline, so they have no key yet -- batch_create_keys is
         # a no-op for anyone who already has one (same as ingestion.py's real
         # ingestion path), but is required here, unlike there, since it can
         # never be assumed to have already happened for this table.
-        self.vault.batch_create_keys(user_ids)
-        contexts = self.vault.batch_get_encryption_contexts(user_ids)
+        self.vault.batch_create_keys(work_user_ids)
+        contexts = self.vault.batch_get_encryption_contexts(work_user_ids)
 
         now_iso = datetime.now(timezone.utc).isoformat()
         vault_records: List[Dict[str, Any]] = []
-        for row in rows:
+        synced_user_ids: Set[str] = set()
+        for row in rows_needing_work:
             user_id = str(row[resource.user_id_column])
             context = contexts.get(user_id)
             if not context:
@@ -174,45 +200,58 @@ WHERE {resource.user_id_column} IS NOT NULL
                 str(row[resource.tenant_id_column]) if resource.tenant_id_column else self.vault.tenant_id
             )
 
-            pii_fields = []
-            for column in encrypt_fields:
+            for column in missing_fields_by_user[user_id]:
                 raw_value = row[column.name]
                 if raw_value is None:
                     continue
                 value = str(raw_value)
-                pii_fields.append(
+                vault_records.append(
                     {
+                        "tenant_id": tenant_id,
+                        "user_id": user_id,
+                        "resource_id": resource.id,
                         "field_name": column.name,
+                        "key_id": context.get("key_id"),
                         "token": ChameleonCrypto.generate_token(context["dek"], value),
                         "encrypted_value": base64.b64encode(
                             self._encrypt_field(context, user_id, value)
                         ).decode("utf-8"),
+                        "synced_at": now_iso,
                     }
                 )
-
-            if not pii_fields:
-                continue
-
-            vault_records.append(
-                {
-                    "tenant_id": tenant_id,
-                    "user_id": user_id,
-                    "resource_id": resource.id,
-                    "key_id": context.get("key_id"),
-                    "pii_fields": pii_fields,
-                    "synced_at": now_iso,
-                }
-            )
+                synced_user_ids.add(user_id)
 
         if vault_records:
             self._load_vault_records(vault_records)
 
-        return len(vault_records)
+        return len(synced_user_ids)
+
+    def _fetch_existing_fields(self, resource_id: str, user_ids: List[str]) -> Dict[str, Set[str]]:
+        """Which (user_id, field_name) pairs this chunk's users already have
+        in pii_vault for this resource -- the per-field diff that lets a
+        partially-synced user pick up only their missing fields."""
+        query = f"""
+SELECT user_id, field_name
+FROM `{self.vault_project_id}.{self.vault_dataset_id}.{self.VAULT_TABLE_ID}`
+WHERE resource_id = @resource_id
+  AND user_id IN UNNEST(@user_ids)
+"""
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("resource_id", "STRING", resource_id),
+                bigquery.ArrayQueryParameter("user_ids", "STRING", user_ids),
+            ]
+        )
+        rows = self.bigquery_client.query(query, job_config=job_config).result()
+        existing: Dict[str, Set[str]] = {}
+        for row in rows:
+            existing.setdefault(row["user_id"], set()).add(row["field_name"])
+        return existing
 
     def _encrypt_field(self, context: Dict[str, Any], user_id: str, value: str) -> bytes:
         """Same bundle format as ingestion.py's _encrypt_field: `key_id:iv_b64:ciphertext_b64`,
         so anything that already knows how to decrypt raw_users.pii_fields can decrypt
-        pii_vault.pii_fields identically."""
+        pii_vault's encrypted_value identically."""
         iv = os.urandom(12)
         raw_bundle_b64 = ChameleonCrypto.encrypt(context["dek"], user_id, value, iv=iv)
         raw_bundle = base64.b64decode(raw_bundle_b64)
@@ -229,4 +268,4 @@ WHERE {resource.user_id_column} IS NOT NULL
         )
         load_job = self.bigquery_client.load_table_from_json(records, table_ref, job_config=job_config)
         load_job.result()
-        logger.info(f"Synced {len(records)} users into {table_ref}")
+        logger.info(f"Synced {len(records)} fields into {table_ref}")
