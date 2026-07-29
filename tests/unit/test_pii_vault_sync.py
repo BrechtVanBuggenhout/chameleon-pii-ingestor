@@ -182,9 +182,13 @@ class TestPiiVaultSyncJob:
         # Regression test for a real OOM: memory usage scaled almost exactly
         # with whatever limit was configured (530MB/512MB, then 1025MB/1GB),
         # the signature of materializing the entire result set at once
-        # rather than a fixed per-request cost. 1250 rows spans 3 chunks at
-        # CHUNK_SIZE=500 (500 + 500 + 250).
-        row_count = 1250
+        # rather than a fixed per-request cost. Uses CHUNK_SIZE directly
+        # (not a hardcoded number) so this doesn't silently stop testing
+        # anything real if the constant is ever retuned again.
+        chunk_size = PiiVaultSyncJob.CHUNK_SIZE
+        row_count = chunk_size * 2 + chunk_size // 2  # e.g. 250 for CHUNK_SIZE=100 -> 3 chunks
+        expected_chunk_sizes = [chunk_size, chunk_size, row_count - 2 * chunk_size]
+
         source_rows = [{"user_id": f"u{i}", "tenant_id": "acme", "email": f"u{i}@example.com"} for i in range(row_count)]
         contexts = {f"u{i}": make_context(f"v{i}") for i in range(row_count)}
         vault = FakeVault([MANUAL_RESOURCE], contexts)
@@ -200,10 +204,10 @@ class TestPiiVaultSyncJob:
         # Three separate load calls (one per chunk), not one giant call --
         # this is what actually keeps peak memory bounded.
         assert len(bq.load_calls) == 3
-        assert [len(records) for records, _ in bq.load_calls] == [500, 500, 250]
+        assert [len(records) for records, _ in bq.load_calls] == expected_chunk_sizes
 
-        # Keys/contexts were also fetched per-chunk, not all 1250 at once.
-        assert [len(ids) for ids in vault.create_keys_calls] == [500, 500, 250]
+        # Keys/contexts were also fetched per-chunk, not all at once.
+        assert [len(ids) for ids in vault.create_keys_calls] == expected_chunk_sizes
 
     def test_continues_past_a_failing_resource(self):
         bad_resource = {**MANUAL_RESOURCE, "resourceId": "not-a-real-id"}
