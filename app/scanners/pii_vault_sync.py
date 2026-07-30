@@ -1,4 +1,5 @@
 import base64
+import json
 import logging
 import os
 import re
@@ -27,7 +28,7 @@ def parse_bigquery_resource_id(resource_id: str) -> tuple[str, str, str]:
 @dataclass(frozen=True)
 class VaultSyncResult:
     resource_id: str
-    users_synced: int
+    chunks_queued: int
     error: Optional[str] = None
 
 
@@ -36,18 +37,47 @@ class PiiVaultSyncJob:
     Daily backfill/sync of manually-declared resources into the central
     pii_vault table -- retroactive protection for tables a customer already
     owns, that were never going to flow through Chameleon's own ingestion
-    pipeline. For each such resource: finds which declared ENCRYPT fields
-    are still missing per user, encrypts only those, and appends them.
+    pipeline.
+
+    Two-phase, fan-out design: `sync_all`/`enumerate_resource` is the fast
+    entry point every trigger (the daily scheduler, and the console's
+    on-demand "Sync Now") calls -- it reads only user IDs from a declared
+    resource's source table, chunks them, and publishes one Pub/Sub message
+    per chunk to the pii_vault_sync_chunks topic, then returns immediately.
+    The actual encrypt-diff-insert work happens later, per chunk, in
+    `process_chunk`, invoked by that topic's own push subscription.
+
+    This replaced an earlier single-invocation design (one call processed
+    an entire resource's users synchronously) after a real problem surfaced
+    live: a first-time backfill of Immoscoop's ~530k real users completed
+    successfully server-side, but the client that triggered it (a plain
+    browser fetch through the console) gave up waiting long before the job
+    finished, reporting failure even though the sync had actually worked.
+    Chunking the *trigger* itself, not just the internal processing, means
+    a trigger call is always fast regardless of table size -- and since a
+    Pub/Sub push subscription enforces a hard 600-second ack deadline,
+    keeping each chunk's own processing time well under that (by construction,
+    CHUNK_SIZE users at a time) avoids ever risking a duplicate redelivery
+    of a still-running chunk.
+
+    `enumerate_resource` deliberately selects ONLY the user ID column from
+    the source table, never the PII field values -- those are re-read fresh,
+    per chunk, in `process_chunk`, immediately before encrypting. Putting
+    plaintext PII into a Pub/Sub message body would be a real step backward
+    from the existing read-then-immediately-encrypt-in-process pattern used
+    everywhere else in this codebase (see ingestion.py), even though message
+    size wouldn't be an issue.
 
     pii_vault is flat -- one row per (tenant_id, user_id, resource_id,
-    field_name), that's the natural unique key, not one row per user with a
-    nested field array -- so the "already synced" check is scoped per field,
-    not per user. This matters because declaring a new field on an
-    already-synced resource (e.g. adding `first_name` a week after `email`
-    was first declared) correctly backfills just that new field for every
-    existing user on the next run, without ever re-touching or duplicating
-    fields they already have. A user missing some of their declared fields
-    simply gets the missing ones appended as new rows.
+    field_name), that's the natural unique key -- so `process_chunk`'s
+    "already synced" check is scoped per field, not per user: a user missing
+    only some of their declared fields gets just those appended, without
+    ever re-touching or duplicating what they already have. Deliberately
+    only detects fields that have never been synced for a user, not changes
+    to a field already synced (e.g. their email changing in the source
+    table) -- a known, deliberate limitation (recomputing this for every
+    field of every user, every run, forever, has a real, unbounded ongoing
+    cost that isn't worth it for this gap).
 
     Encryption reuses the exact same per-user DEK + local AES-GCM +
     HMAC-token pattern as the real ingestion pipeline (see
@@ -55,30 +85,14 @@ class PiiVaultSyncJob:
     so a row synced here is indistinguishable in shape from one that came
     through normal ingestion, and shredding a user's key makes both
     equally unreadable.
-
-    Deliberately only detects fields that have never been synced for a
-    user, not changes to a field already synced (e.g. their email changing
-    in the source table) -- a known, named limitation for this pass, not a
-    silently swallowed gap. Handling in-place updates would need a second
-    mechanism if it turns out to matter.
     """
 
     VAULT_TABLE_ID = "pii_vault"
-    # A first sync of an existing table processes every one of its rows --
-    # for a real production user table that can be a lot of rows. Chunking
-    # keeps peak memory bounded to one chunk's worth of rows/contexts/output
-    # records regardless of table size, instead of materializing the entire
-    # result set (a real OOM hit a real customer: usage scaled almost
-    # exactly with whatever memory limit was configured, the signature of
-    # an all-at-once accumulation, not a fixed per-request cost).
-    #
-    # Lowered from 500 -> 100: chunking alone didn't stop OOMs against real
-    # data (this worker's own baseline footprint -- FastAPI + pandas + every
-    # google-cloud-* client loaded at startup -- sits close to whatever
-    # memory limit is configured, so even a 500-row chunk's transient
-    # overhead was enough to tip it over). Paired with a memory bump on the
-    # infra side; smaller chunks reduce the peak this code adds on top of
-    # that fixed baseline, independent of how generous the limit is.
+    # Both the enumeration query and the per-chunk re-query are scoped to
+    # this many user IDs at a time -- keeps enumeration's own memory
+    # footprint trivial (it only ever holds ID strings, never full rows),
+    # and keeps each chunk's processing time comfortably under Pub/Sub's
+    # 600-second push ack deadline.
     CHUNK_SIZE = 100
 
     def __init__(
@@ -87,11 +101,15 @@ class PiiVaultSyncJob:
         vault: VaultClient,
         vault_project_id: str,
         vault_dataset_id: str,
+        publisher: Any,
+        chunk_topic_path: str,
     ):
         self.bigquery_client = bigquery_client
         self.vault = vault
         self.vault_project_id = vault_project_id
         self.vault_dataset_id = vault_dataset_id
+        self.publisher = publisher
+        self.chunk_topic_path = chunk_topic_path
 
     def sync_all(self) -> List[VaultSyncResult]:
         registry_data = self.vault.fetch_pii_registry_resources(owner_connector="manual")
@@ -100,14 +118,14 @@ class PiiVaultSyncJob:
         results: List[VaultSyncResult] = []
         for resource in registry.resources:
             try:
-                count = self.sync_resource(resource)
-                results.append(VaultSyncResult(resource_id=resource.id, users_synced=count))
+                count = self.enumerate_resource(resource)
+                results.append(VaultSyncResult(resource_id=resource.id, chunks_queued=count))
             except Exception as e:
-                logger.error(f"Failed to sync {resource.id} into pii_vault: {e}")
-                results.append(VaultSyncResult(resource_id=resource.id, users_synced=0, error=str(e)))
+                logger.error(f"Failed to enumerate {resource.id} for pii_vault sync: {e}")
+                results.append(VaultSyncResult(resource_id=resource.id, chunks_queued=0, error=str(e)))
         return results
 
-    def sync_resource(self, resource: RegistryResource) -> int:
+    def enumerate_resource(self, resource: RegistryResource) -> int:
         if resource.system != "bigquery":
             logger.info(f"Skipping {resource.id} -- only bigquery sources are supported today")
             return 0
@@ -121,38 +139,70 @@ class PiiVaultSyncJob:
             return 0
 
         project_id, dataset_id, table_id = parse_bigquery_resource_id(resource.id)
+
+        query = f"""
+SELECT {resource.user_id_column}
+FROM `{project_id}.{dataset_id}.{table_id}`
+WHERE {resource.user_id_column} IS NOT NULL
+"""
+        # Deliberately NOT wrapped in list(...) -- same reasoning as the old
+        # single-phase design: page results in from the API as we go rather
+        # than holding the whole table at once. Much cheaper here regardless,
+        # since each row is now just one ID string, not a full row of PII
+        # field values plus encryption context.
+        row_iterator = self.bigquery_client.query(query).result()
+
+        chunks_queued = 0
+        chunk: List[str] = []
+        for row in row_iterator:
+            chunk.append(str(row[resource.user_id_column]))
+            if len(chunk) >= self.CHUNK_SIZE:
+                self._publish_chunk(resource.id, chunk)
+                chunks_queued += 1
+                chunk = []
+        if chunk:
+            self._publish_chunk(resource.id, chunk)
+            chunks_queued += 1
+
+        return chunks_queued
+
+    def _publish_chunk(self, resource_id: str, user_ids: List[str]) -> None:
+        payload = json.dumps({"resource_id": resource_id, "user_ids": user_ids}).encode("utf-8")
+        future = self.publisher.publish(self.chunk_topic_path, payload)
+        # Block for the publish to actually succeed rather than fire-and-forget --
+        # a silently dropped chunk means those users never get synced at all,
+        # with nothing left to retry them.
+        future.result()
+
+    def process_chunk(self, resource_id: str, user_ids: List[str]) -> int:
+        registry_data = self.vault.fetch_pii_registry_resources(owner_connector="manual")
+        registry = PiiMetadataRegistry.from_api_response(registry_data)
+        resource = next((r for r in registry.resources if r.id == resource_id), None)
+        if resource is None:
+            logger.warning(f"process_chunk: {resource_id} is no longer declared, dropping a chunk of {len(user_ids)} users")
+            return 0
+
+        encrypt_fields = [c for c in resource.columns if c.handling == "ENCRYPT"]
+        if not encrypt_fields:
+            return 0
+
+        project_id, dataset_id, table_id = parse_bigquery_resource_id(resource.id)
         field_names = [c.name for c in encrypt_fields]
         select_cols = ", ".join(
             [resource.user_id_column] + field_names + ([resource.tenant_id_column] if resource.tenant_id_column else [])
         )
 
-        # No "already synced" exclusion here -- pii_vault is scoped per
-        # field now, so whether a user needs any work at all depends on
-        # *which* fields they're missing, not just whether they appear in
-        # the vault anywhere. That diff happens per chunk in _sync_chunk,
-        # scoped to just that chunk's user_ids, instead of one blanket
-        # subquery against the whole vault table up front.
         query = f"""
 SELECT {select_cols}
 FROM `{project_id}.{dataset_id}.{table_id}`
-WHERE {resource.user_id_column} IS NOT NULL
+WHERE CAST({resource.user_id_column} AS STRING) IN UNNEST(@user_ids)
 """
-        # Deliberately NOT wrapped in list(...) -- iterating the RowIterator
-        # directly lets the BigQuery client page results in from the API as
-        # we go, instead of downloading and holding the entire table in
-        # memory before processing a single row.
-        row_iterator = self.bigquery_client.query(query).result()
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("user_ids", "STRING", user_ids)]
+        )
+        rows = list(self.bigquery_client.query(query, job_config=job_config).result())
 
-        total_synced = 0
-        chunk: List[Any] = []
-        for row in row_iterator:
-            chunk.append(row)
-            if len(chunk) >= self.CHUNK_SIZE:
-                total_synced += self._sync_chunk(resource, encrypt_fields, chunk)
-                chunk = []
-        total_synced += self._sync_chunk(resource, encrypt_fields, chunk)
-
-        return total_synced
+        return self._sync_chunk(resource, encrypt_fields, rows)
 
     def _sync_chunk(self, resource: RegistryResource, encrypt_fields: List[Any], rows: List[Any]) -> int:
         if not rows:

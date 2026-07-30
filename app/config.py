@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     JANITOR_DLQ_TOPIC: str
     PII_TOPIC_ID: str
     LINEAGE_TOPIC_ID: str
+    # Fan-out target for PiiVaultSyncJob.enumerate_resource -- one message
+    # per chunk of user IDs, consumed by /pii-vault-sync-chunk via this
+    # topic's own push subscription. Fully-qualified (projects/<id>/topics/<name>),
+    # matching PII_TOPIC_ID/LINEAGE_TOPIC_ID's own convention.
+    PII_VAULT_SYNC_CHUNK_TOPIC_ID: str
     LANDING_ZONE_BUCKET: str
     BIGQUERY_DATASET: str
     # Optional overrides of BIGQUERY_DATASET (see ingestor.py's fallback chain).

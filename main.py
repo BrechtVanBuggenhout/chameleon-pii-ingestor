@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastavro import schemaless_reader
+from google.cloud import pubsub_v1
 from app.pipelines.ingestion import USER_SCHEMA
 from app.api import discovery
 from app.config import settings
@@ -36,12 +37,18 @@ async def lifespan(app: FastAPI):
         gcs_service=gcs
     )
     
+    pii_vault_sync_publisher = pubsub_v1.PublisherClient()
+
     # Store for DI
     app.state.vault = vault
     app.state.pipeline = pipeline
     app.state.bq = bq
     app.state.warehouse_writer = warehouse_writer
     app.state.gcs = gcs
+    app.state.pii_vault_sync_publisher = pii_vault_sync_publisher
+    # Fully-qualified already (projects/<id>/topics/<name>), matching
+    # PII_TOPIC_ID/LINEAGE_TOPIC_ID's own convention -- not a short topic ID.
+    app.state.pii_vault_sync_chunk_topic_path = settings.PII_VAULT_SYNC_CHUNK_TOPIC_ID
 
     # Identifies the PII registry declaration for bulk file drops -- matches
     # the resourceId convention the console/Key Vault registry already uses

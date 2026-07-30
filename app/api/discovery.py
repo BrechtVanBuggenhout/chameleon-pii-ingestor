@@ -1,7 +1,10 @@
 import asyncio
+import base64
+import json
 import logging
 
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.scanners.warehouse_metadata_crawler import BigQueryWarehouseMetadataCrawler
@@ -50,39 +53,85 @@ async def warehouse_crawl(request: Request):
     return {"status": "ok", "resources_scanned": len(diffs), "counts": counts}
 
 
+def _pii_vault_sync_job(request: Request) -> PiiVaultSyncJob:
+    return PiiVaultSyncJob(
+        bigquery_client=request.app.state.bq.client,
+        vault=request.app.state.vault,
+        vault_project_id=settings.GOOGLE_CLOUD_PROJECT,
+        vault_dataset_id=settings.BIGQUERY_DATASET,
+        publisher=request.app.state.pii_vault_sync_publisher,
+        chunk_topic_path=request.app.state.pii_vault_sync_chunk_topic_path,
+    )
+
+
 @router.post("/pii-vault-sync")
 async def pii_vault_sync(request: Request):
     """
-    Daily backfill/sync of manually-declared resources into the central
-    pii_vault table -- retroactive protection for tables a customer already
-    owns that were never going to flow through Chameleon's own ingestion
-    pipeline. Never touches the source table. Intended to be invoked on a
-    schedule (Cloud Scheduler -> Cloud Run, OIDC), same as warehouse-crawl.
+    Entry point for both the daily scheduler and the console's on-demand
+    "Sync Now" -- enumerates which users need syncing for each declared
+    resource and publishes one Pub/Sub message per chunk to
+    pii_vault_sync_chunks, then returns immediately. Never touches the
+    source table, and never does the actual encrypt-diff-insert work
+    itself -- that happens per chunk in /pii-vault-sync-chunk below,
+    triggered by that topic's own push subscription. See
+    PiiVaultSyncJob's docstring for why this is chunked at the trigger
+    level and not just internally: a single synchronous invocation used to
+    mean a client triggering this for a large table (Immoscoop's real
+    ~530k users) could give up waiting long before the job actually
+    finished, even though the job itself completed correctly server-side.
     """
-    vault = request.app.state.vault
-    bq_client = request.app.state.bq.client
-
-    job = PiiVaultSyncJob(
-        bigquery_client=bq_client,
-        vault=vault,
-        vault_project_id=settings.GOOGLE_CLOUD_PROJECT,
-        vault_dataset_id=settings.BIGQUERY_DATASET,
-    )
+    job = _pii_vault_sync_job(request)
 
     results = await asyncio.to_thread(job.sync_all)
 
-    total_synced = sum(r.users_synced for r in results)
+    total_chunks = sum(r.chunks_queued for r in results)
     errors = [{"resourceId": r.resource_id, "error": r.error} for r in results if r.error]
 
     logger.info(
-        "PII vault sync complete: %s resources, %s users synced, %s errors",
+        "PII vault sync enumeration complete: %s resources, %s chunks queued, %s errors",
         len(results),
-        total_synced,
+        total_chunks,
         len(errors),
     )
     return {
-        "status": "ok",
-        "resources_synced": len(results),
-        "users_synced": total_synced,
+        "status": "queued",
+        "resources_queued": len(results),
+        "chunks_queued": total_chunks,
         "errors": errors,
     }
+
+
+@router.post("/pii-vault-sync-chunk")
+async def pii_vault_sync_chunk(request: Request):
+    """
+    Pub/Sub push subscription endpoint for pii_vault_sync_chunks. Each
+    message is one chunk (PiiVaultSyncJob.CHUNK_SIZE user IDs) of one
+    declared resource, published by /pii-vault-sync's enumeration step
+    above. Small and fast by construction, so a single invocation of this
+    endpoint never risks Pub/Sub's 600-second push ack deadline the way a
+    whole-table sync used to when it ran as one synchronous request.
+
+    Pub/Sub push envelope format:
+      { "message": { "data": "<base64 json>", "messageId": "..." }, "subscription": "..." }
+
+    Returns 200 to acknowledge; 500 causes Pub/Sub to retry.
+    """
+    try:
+        envelope = await request.json()
+        message = envelope.get("message", {})
+        payload = json.loads(base64.b64decode(message.get("data", "")).decode("utf-8"))
+        resource_id = payload["resource_id"]
+        user_ids = payload["user_ids"]
+    except Exception as e:
+        logger.error(f"Failed to decode pii_vault_sync_chunks message: {e}")
+        return JSONResponse(status_code=200, content={"status": "ignored", "reason": "malformed"})
+
+    job = _pii_vault_sync_job(request)
+
+    try:
+        synced = await asyncio.to_thread(job.process_chunk, resource_id, user_ids)
+        logger.info(f"pii_vault_sync_chunk: {resource_id} -- {synced} users synced out of {len(user_ids)} in chunk")
+        return {"status": "ok", "resource_id": resource_id, "users_synced": synced}
+    except Exception as e:
+        logger.error(f"process_chunk failed for {resource_id} ({len(user_ids)} users): {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
