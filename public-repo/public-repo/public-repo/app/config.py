@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     KMS_SIGNING_PROJECT_ID: str
     KMS_SIGNING_KEY_RING: str
     KMS_SIGNING_KEY_NAME: str
+    KMS_SIGNING_KEY_VERSION: str = "1"
 
     # Selects the ingestion write-path destination. "bigquery" (default) keeps
     # existing behavior untouched; "snowflake" requires the PII_INGESTOR_SNOWFLAKE_*
