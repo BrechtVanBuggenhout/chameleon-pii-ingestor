@@ -11,7 +11,6 @@ google-cloud-bigquery[pandas]
 aiohttp
 google-cloud-pubsub
 google-cloud-kms
-google-cloud-secret-manager
 snowflake-connector-python
 requests
 cryptography
