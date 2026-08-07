@@ -293,6 +293,21 @@ class VaultClient:
         res.raise_for_status()
         return res.json()
 
+    def mark_resource_synced(self, resource_id: str, synced_at_iso: str) -> Dict[str, Any]:
+        """
+        Advances a manually-declared resource's pii_vault sync watermark
+        (see pii_vault_sync.py's incremental enumerate_resource path) after
+        a full or incremental scan of it succeeds. Key Vault does a
+        compare-and-swap server-side, so this is safe to call even if an
+        overlapping run (e.g. Sync Now firing close to the daily scheduler)
+        finishes with an earlier timestamp after this one.
+        """
+        encoded_resource_id = quote(resource_id, safe="")
+        url = f"{self.base_url}/pii-registry/resources/{encoded_resource_id}/mark-synced"
+        res = self.session.post(url, json={"lastSyncedAt": synced_at_iso})
+        res.raise_for_status()
+        return res.json()
+
     def fetch_pii_registry_policy(self) -> Dict[str, Any]:
         """
         Reads the coarse PII registry policy status for dbt/demo checks.
