@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.scanners.warehouse_metadata_crawler import BigQueryWarehouseMetadataCrawler
+from app.scanners.dbt_pii_discovery_publisher import DbtPiiDiscoveryPublisher
 from app.scanners.pii_vault_sync import PiiVaultSyncJob
 
 router = APIRouter()
@@ -53,6 +54,44 @@ async def warehouse_crawl(request: Request):
     return {"status": "ok", "resources_scanned": len(diffs), "counts": counts}
 
 
+@router.post("/publish-dbt-pii-discovery")
+async def publish_dbt_pii_discovery(request: Request):
+    """
+    Publishes the chameleon_pii dbt package's pii_discovery findings (undeclared,
+    name-inferred PII columns) into the same WAREHOUSE_METADATA_DISCOVERED
+    lineage feed /warehouse-crawl above writes to, so they reach the console's
+    live "declare this" work queue (GET /pii-registry/discovery) without
+    waiting for Key Vault's boot-time dbt-registry pull to catch up. Intended
+    to run right after a scheduled `dbt build` completes (Cloud Scheduler ->
+    Cloud Run, OIDC, same pattern as /warehouse-crawl) -- it reads
+    pii_discovery's output, it does not invoke dbt itself. Metadata only:
+    column names and inferred classifications, never values.
+
+    No-op (0 resources) if DBT_PII_DISCOVERY_DATASETS is empty -- opt-in, like
+    warehouse discovery above.
+    """
+    vault = request.app.state.vault
+    bq_client = request.app.state.bq.client  # raw google.cloud.bigquery.Client
+
+    publisher = DbtPiiDiscoveryPublisher(
+        bigquery_client=bq_client,
+        vault=vault,
+        pii_discovery_locations=_comma_list(settings.DBT_PII_DISCOVERY_DATASETS),
+    )
+
+    # Same rationale as /warehouse-crawl: synchronous BigQuery I/O, keep the
+    # event loop responsive.
+    resources = await asyncio.to_thread(publisher.publish)
+
+    field_count = sum(len(r.fields) for r in resources)
+    logger.info(
+        "dbt PII discovery publish complete: %s resource(s), %s undeclared field(s)",
+        len(resources),
+        field_count,
+    )
+    return {"status": "ok", "resources_published": len(resources), "fields_published": field_count}
+
+
 def _pii_vault_sync_job(request: Request) -> PiiVaultSyncJob:
     return PiiVaultSyncJob(
         bigquery_client=request.app.state.bq.client,
@@ -80,23 +119,30 @@ async def pii_vault_sync(request: Request):
     ~530k users) could give up waiting long before the job actually
     finished, even though the job itself completed correctly server-side.
 
-    Optional JSON body: {"force_full_scan": bool}. The daily Cloud
-    Scheduler call sends no body at all, which defaults to False (so
-    opted-in resources get incremental treatment); Sync Now
+    Optional JSON body: {"force_full_scan": bool, "resource_id": str}. The
+    daily Cloud Scheduler call sends no body at all, which defaults to
+    False (so opted-in resources get incremental treatment); Sync Now
     (PiiVaultSyncTrigger) always sends true, since it's the customer's
     manual "did I miss something" lever -- an incremental scan wouldn't
     catch e.g. a newly-declared field on an already-synced resource, which
-    has no concept of "row unchanged, but a field was added."
+    has no concept of "row unchanged, but a field was added." When
+    resource_id is present, only that one declared resource is enumerated
+    instead of every manually-declared resource for the tenant.
     """
     try:
         payload = await request.json()
     except Exception:
         payload = {}
     force_full_scan = bool(payload.get("force_full_scan", False)) if isinstance(payload, dict) else False
+    resource_id = payload.get("resource_id") if isinstance(payload, dict) else None
 
     job = _pii_vault_sync_job(request)
 
-    results = await asyncio.to_thread(job.sync_all, force_full_scan)
+    if resource_id:
+        result = await asyncio.to_thread(job.sync_one, resource_id, force_full_scan)
+        results = [result]
+    else:
+        results = await asyncio.to_thread(job.sync_all, force_full_scan)
 
     total_chunks = sum(r.chunks_queued for r in results)
     errors = [{"resourceId": r.resource_id, "error": r.error} for r in results if r.error]

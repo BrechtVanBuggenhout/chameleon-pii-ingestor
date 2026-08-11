@@ -125,6 +125,31 @@ class PiiVaultSyncJob:
                 results.append(VaultSyncResult(resource_id=resource.id, chunks_queued=0, error=str(e)))
         return results
 
+    def sync_one(self, resource_id: str, force_full_scan: bool = False) -> VaultSyncResult:
+        """
+        Same as sync_all, scoped to a single declared resource -- backs the
+        console's per-resource Sync Now action so re-syncing one large,
+        already-synced table doesn't mean re-scanning every other declared
+        resource for the tenant too.
+        """
+        try:
+            data = self.vault.fetch_pii_registry_resource(resource_id)
+            resource_data = data.get("resource")
+            if not resource_data:
+                return VaultSyncResult(resource_id=resource_id, chunks_queued=0, error="Resource not found in registry")
+            resource = RegistryResource.from_dict(resource_data)
+            if resource.owner_connector != "manual":
+                return VaultSyncResult(
+                    resource_id=resource.id,
+                    chunks_queued=0,
+                    error="Sync Now only applies to manually-declared resources",
+                )
+            count = self.enumerate_resource(resource, force_full_scan=force_full_scan)
+            return VaultSyncResult(resource_id=resource.id, chunks_queued=count)
+        except Exception as e:
+            logger.error(f"Failed to enumerate {resource_id} for pii_vault sync: {e}")
+            return VaultSyncResult(resource_id=resource_id, chunks_queued=0, error=str(e))
+
     def enumerate_resource(self, resource: RegistryResource, force_full_scan: bool = False) -> int:
         if resource.system != "bigquery":
             logger.info(f"Skipping {resource.id} -- only bigquery sources are supported today")
