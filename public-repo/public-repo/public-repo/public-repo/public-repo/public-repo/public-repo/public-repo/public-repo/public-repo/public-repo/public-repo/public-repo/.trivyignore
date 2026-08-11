@@ -1,0 +1,5 @@
+# jaraco.context and wheel vendored inside setuptools — cannot be upgraded via pip.
+# Fixed in setuptools >= 80.9.0 which vendors jaraco.context >= 6.1.0 and wheel >= 0.46.2.
+# If these reappear after upgrading setuptools, suppress here until setuptools ships the fix.
+CVE-2026-23949
+CVE-2026-24049
