@@ -78,6 +78,13 @@ class Settings(BaseSettings):
     PII_INGESTOR_SNOWFLAKE_WAREHOUSE: Optional[str] = None
     PII_INGESTOR_SNOWFLAKE_DATABASE: Optional[str] = None
     PII_INGESTOR_SNOWFLAKE_SCHEMA: Optional[str] = None
+    # The version tag (e.g. "v2026.08.20") this deployment's images are
+    # pinned to in Terraform -- set alongside the *_container_image
+    # variables, updated in lockstep by scripts/update.sh's git merge. None
+    # on deployments that predate versioned images (self-built, or an
+    # install from before this existed) -- source_staleness_check reports
+    # "unknown" rather than a false "stale" in that case.
+    PLATFORM_VERSION: Optional[str] = None
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

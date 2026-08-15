@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import uuid
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -128,6 +129,14 @@ async def pii_vault_sync(request: Request):
     has no concept of "row unchanged, but a field was added." When
     resource_id is present, only that one declared resource is enumerated
     instead of every manually-declared resource for the tenant.
+
+    Also creates a sync_runs record in Key Vault (see SyncRunRepository)
+    for the console's progress bar to poll, and returns its runId. Created
+    BEFORE enumeration starts, not after -- a fast chunk can be fully
+    processed by Pub/Sub before enumeration across every resource finishes,
+    so the run doc must already exist by the time the first chunk's
+    progress report could possibly arrive. Best-effort throughout: a Key
+    Vault hiccup here degrades the progress bar, never the sync itself.
     """
     try:
         payload = await request.json()
@@ -138,14 +147,27 @@ async def pii_vault_sync(request: Request):
 
     job = _pii_vault_sync_job(request)
 
+    run_id = str(uuid.uuid4())
+    try:
+        await asyncio.to_thread(job.vault.create_sync_run, run_id, resource_id)
+    except Exception as e:
+        logger.warning(f"Failed to create sync run {run_id}, progress bar will be unavailable for this sync: {e}")
+        run_id = None
+
     if resource_id:
-        result = await asyncio.to_thread(job.sync_one, resource_id, force_full_scan)
+        result = await asyncio.to_thread(job.sync_one, resource_id, force_full_scan, run_id)
         results = [result]
     else:
-        results = await asyncio.to_thread(job.sync_all, force_full_scan)
+        results = await asyncio.to_thread(job.sync_all, force_full_scan, run_id)
 
     total_chunks = sum(r.chunks_queued for r in results)
     errors = [{"resourceId": r.resource_id, "error": r.error} for r in results if r.error]
+
+    if run_id:
+        try:
+            await asyncio.to_thread(job.vault.finalize_sync_run_total, run_id, total_chunks)
+        except Exception as e:
+            logger.warning(f"Failed to finalize sync run {run_id} total: {e}")
 
     logger.info(
         "PII vault sync enumeration complete: %s resources, %s chunks queued, %s errors",
@@ -158,6 +180,7 @@ async def pii_vault_sync(request: Request):
         "resources_queued": len(results),
         "chunks_queued": total_chunks,
         "errors": errors,
+        "runId": run_id,
     }
 
 
@@ -182,6 +205,7 @@ async def pii_vault_sync_chunk(request: Request):
         payload = json.loads(base64.b64decode(message.get("data", "")).decode("utf-8"))
         resource_id = payload["resource_id"]
         user_ids = payload["user_ids"]
+        run_id = payload.get("run_id")
     except Exception as e:
         logger.error(f"Failed to decode pii_vault_sync_chunks message: {e}")
         return JSONResponse(status_code=200, content={"status": "ignored", "reason": "malformed"})
@@ -189,7 +213,7 @@ async def pii_vault_sync_chunk(request: Request):
     job = _pii_vault_sync_job(request)
 
     try:
-        synced = await asyncio.to_thread(job.process_chunk, resource_id, user_ids)
+        synced = await asyncio.to_thread(job.process_chunk, resource_id, user_ids, run_id)
         logger.info(f"pii_vault_sync_chunk: {resource_id} -- {synced} users synced out of {len(user_ids)} in chunk")
         return {"status": "ok", "resource_id": resource_id, "users_synced": synced}
     except Exception as e:

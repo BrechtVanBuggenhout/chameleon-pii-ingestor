@@ -17,6 +17,7 @@ _FAKE_SETTINGS = {
     "JANITOR_DLQ_TOPIC": "test-janitor-dlq",
     "PII_TOPIC_ID": "projects/test-project/topics/test-pii-ingestion",
     "LINEAGE_TOPIC_ID": "projects/test-project/topics/test-lineage-events",
+    "PII_VAULT_SYNC_CHUNK_TOPIC_ID": "projects/test-project/topics/test-pii-vault-sync-chunks",
     "LANDING_ZONE_BUCKET": "test-landing-zone",
     "BIGQUERY_DATASET": "test_dataset",
     "KMS_KEY_PATH": "projects/test-project/locations/us-central1/keyRings/test-ring/cryptoKeys/test-key",
