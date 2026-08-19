@@ -47,10 +47,22 @@ class VaultClient:
         # as per-call headers (self._registry_write_headers), not merged into
         # self.session.headers, since every other call through this session
         # still needs to authenticate as VAULT_API_TOKEN, not this token.
+        #
+        # Both the x-api-key AND the Authorization override are required here
+        # -- confirmed live 2026-08-13: sending only Authorization passed
+        # requireWriteAuth but broke Key Vault's *global* onRequest hook
+        # (main.ts), which checks `x-api-key ?? Authorization` against
+        # VAULT_API_TOKEN for every request and runs before any route-level
+        # preHandler. This session's requests.Session never sends x-api-key
+        # at all (only Authorization, set above) -- so overriding Authorization
+        # alone left the global hook with no valid credential to fall back to,
+        # 401ing before the request ever reached requireWriteAuth.
         registry_write_token = os.environ.get("PII_REGISTRY_WRITE_TOKEN")
-        self._registry_write_headers: Dict[str, str] = (
-            {"Authorization": f"Bearer {registry_write_token}"} if registry_write_token else {}
-        )
+        self._registry_write_headers: Dict[str, str] = {}
+        if vault_api_token:
+            self._registry_write_headers["x-api-key"] = vault_api_token
+        if registry_write_token:
+            self._registry_write_headers["Authorization"] = f"Bearer {registry_write_token}"
         retry_strategy = Retry(
             total=5,
             backoff_factor=1,
