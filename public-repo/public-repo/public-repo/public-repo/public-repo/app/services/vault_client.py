@@ -308,6 +308,43 @@ class VaultClient:
         res.raise_for_status()
         return res.json()
 
+    def create_sync_run(self, run_id: str, resource_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Registers a new sync_runs doc in Key Vault before any chunk for this
+        run can possibly be processed -- see pii_vault_sync.py's sync_all/
+        sync_one for why the total isn't known yet at this point (it must be
+        created before enumeration, not after, to avoid a race where a fast
+        chunk finishes before the run itself exists).
+        """
+        body: Dict[str, Any] = {"runId": run_id, "tenantId": self.tenant_id}
+        if resource_id:
+            body["resourceId"] = resource_id
+        url = f"{self.base_url}/pii-registry/sync-runs"
+        res = self.session.post(url, json=body)
+        res.raise_for_status()
+        return res.json()
+
+    def finalize_sync_run_total(self, run_id: str, chunks_total: int) -> Dict[str, Any]:
+        """Called once enumeration finishes and the real chunk count is known."""
+        url = f"{self.base_url}/pii-registry/sync-runs/{run_id}/finalize-total"
+        res = self.session.post(url, json={"chunksTotal": chunks_total})
+        res.raise_for_status()
+        return res.json()
+
+    def record_sync_chunk_outcome(self, run_id: str, outcome: str) -> None:
+        """
+        Best-effort per-chunk progress report from process_chunk. Never
+        raises on a Key Vault-side failure -- a progress bar going stale is
+        vastly preferable to a real chunk sync failing because progress
+        reporting hiccuped.
+        """
+        try:
+            url = f"{self.base_url}/pii-registry/sync-runs/{run_id}/progress"
+            res = self.session.post(url, json={"outcome": outcome})
+            res.raise_for_status()
+        except Exception as e:
+            logger.warning(f"Failed to record sync run progress for {run_id}: {e}")
+
     def mark_resource_sync_attempted(self, resource_id: str, attempted_at_iso: str) -> Dict[str, Any]:
         """
         Records that a sync run genuinely completed for this resource --
