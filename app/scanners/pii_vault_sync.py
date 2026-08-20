@@ -13,6 +13,7 @@ from google.cloud import bigquery
 
 from app.core.crypto import ChameleonCrypto
 from app.policies.pii_registry import PiiMetadataRegistry, RegistryResource
+from app.scanners.encrypted_copy_writer import EncryptedCopyWriter
 from app.services.vault_client import VaultClient
 
 logger = logging.getLogger(__name__)
@@ -130,6 +131,7 @@ class PiiVaultSyncJob:
         self.vault_dataset_id = vault_dataset_id
         self.publisher = publisher
         self.chunk_topic_path = chunk_topic_path
+        self.encrypted_copy_writer = EncryptedCopyWriter(bigquery_client)
 
     def sync_all(self, force_full_scan: bool = False, run_id: Optional[str] = None) -> List[VaultSyncResult]:
         registry_data = self.vault.fetch_pii_registry_resources(owner_connector="manual")
@@ -385,8 +387,27 @@ WHERE CAST({resource.user_id_column} AS STRING) IN UNNEST(@user_ids)
 
         if vault_records:
             self._load_vault_records(vault_records)
+            self._append_encrypted_copy(resource, rows_needing_work, vault_records)
 
         return len(synced_user_ids)
+
+    def _append_encrypted_copy(
+        self, resource: RegistryResource, rows_needing_work: List[Any], vault_records: List[Dict[str, Any]]
+    ) -> None:
+        """Best-effort: the real pii_vault write above has already
+        succeeded by the time this runs, and must never be undone by a
+        problem here. Most commonly hit when a resource has just been
+        declared with ENCRYPTED_COPY but Key Vault's declare-time
+        ensureEncryptedCopyTable() hasn't created `{table}_encrypted_raw`
+        yet (or failed to) -- this chunk's real work is still complete
+        without it; the next sync run picks up the backfill once the table
+        exists."""
+        if not resource.wants_encrypted_copy():
+            return
+        try:
+            self.encrypted_copy_writer.append(resource, rows_needing_work, vault_records)
+        except Exception as e:
+            logger.warning(f"Encrypted-copy append failed for {resource.id}, continuing without it: {e}")
 
     def _fetch_existing_fields(self, resource_id: str, user_ids: List[str]) -> Dict[str, Set[str]]:
         """Which (user_id, field_name) pairs this chunk's users already have

@@ -23,14 +23,6 @@ class FakeQueryJob:
         return self._rows
 
 
-class FakeLoadJob:
-    def __init__(self, on_load):
-        self._on_load = on_load
-
-    def result(self):
-        self._on_load()
-
-
 class FakeBigQueryClient:
     """
     Routes each query() call to the right fixture based on shape, since the
@@ -86,11 +78,9 @@ class FakeBigQueryClient:
         matching = [r for r in self.source_rows if str(r[self.user_id_column]) in requested_ids]
         return FakeQueryJob(matching)
 
-    def load_table_from_json(self, records, table_ref, job_config=None):
-        def on_load():
-            self.load_calls.append((records, table_ref))
-
-        return FakeLoadJob(on_load)
+    def insert_rows_json(self, table_ref, records):
+        self.load_calls.append((records, table_ref))
+        return []  # no per-row errors
 
     @property
     def loaded_records(self):
@@ -624,45 +614,30 @@ class TestSyncRunProgressReporting:
         assert vault.record_chunk_outcome_calls == []
 
 
-class FlakyLoadJob:
-    """Raises TooManyRequests on .result() a configured number of times
-    before finally succeeding -- simulates BigQuery's per-table write-rate
-    quota tripping on a load job."""
-
-    def __init__(self, on_load, raise_count, call_counter):
-        self._on_load = on_load
-        self._raise_count = raise_count
-        self._call_counter = call_counter
-
-    def result(self):
-        self._call_counter[0] += 1
-        if self._call_counter[0] <= self._raise_count:
-            raise TooManyRequests("Exceeded rate limits: too many table update operations for this table.")
-        self._on_load()
-
-
 class FlakyBigQueryClient(FakeBigQueryClient):
-    """Same as FakeBigQueryClient, except load_table_from_json's returned
-    job raises TooManyRequests on its first `raise_count` .result() calls."""
+    """Same as FakeBigQueryClient, except insert_rows_json raises
+    TooManyRequests on its first `raise_count` calls -- simulates
+    BigQuery's per-table write-rate quota tripping on a streaming insert."""
 
     def __init__(self, *args, raise_count=0, **kwargs):
         super().__init__(*args, **kwargs)
         self._raise_count = raise_count
         self._load_attempts = [0]
 
-    def load_table_from_json(self, records, table_ref, job_config=None):
-        def on_load():
-            self.load_calls.append((records, table_ref))
-
-        return FlakyLoadJob(on_load, self._raise_count, self._load_attempts)
+    def insert_rows_json(self, table_ref, records):
+        self._load_attempts[0] += 1
+        if self._load_attempts[0] <= self._raise_count:
+            raise TooManyRequests("Exceeded rate limits: too many table update operations for this table.")
+        self.load_calls.append((records, table_ref))
+        return []
 
 
 class TestLoadVaultRecordsRetry:
-    """_load_vault_records: a single load job per chunk can trip BigQuery's
-    per-table write-rate quota (confirmed live: 429 rateLimitExceeded,
-    reason table.write) when many chunks land close together. Must retry
-    with backoff instead of dropping the chunk's data or failing the sync
-    outright on the first rate-limit response."""
+    """_load_vault_records: even a streaming insert per 100-user chunk can
+    still trip BigQuery's per-table write-rate quota under enough
+    concurrent chunks (confirmed live against Immoscoop's real sync,
+    2026-08-19). Must retry with backoff instead of dropping the chunk's
+    data or failing the sync outright on the first rate-limit response."""
 
     def test_retries_a_rate_limited_load_job_and_still_syncs(self, monkeypatch):
         monkeypatch.setattr("app.scanners.pii_vault_sync.time.sleep", lambda _seconds: None)

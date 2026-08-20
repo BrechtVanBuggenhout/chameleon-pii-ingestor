@@ -1,6 +1,6 @@
 import base64
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -42,7 +42,10 @@ def test_pii_vault_sync_enumerates_and_returns_queued_immediately():
     assert body["status"] == "queued"
     assert body["resources_queued"] == 0
     assert body["chunks_queued"] == 0
-    fake_job.sync_all.assert_called_once_with(False)
+    assert body["runId"]  # a sync_runs record is always created for the progress bar
+    fake_job.sync_all.assert_called_once_with(False, body["runId"])
+    fake_job.vault.create_sync_run.assert_called_once_with(body["runId"], None)
+    fake_job.vault.finalize_sync_run_total.assert_called_once_with(body["runId"], 0)
     fake_job.process_chunk.assert_not_called()
     # Constructed with the app-state publisher/topic path, not left unset.
     _, kwargs = job_cls.call_args
@@ -61,7 +64,7 @@ def test_pii_vault_sync_with_no_body_defaults_force_full_scan_to_false():
         response = TestClient(_make_app()).post("/api/v1/pii-vault-sync", content=b"")
 
     assert response.status_code == 200
-    fake_job.sync_all.assert_called_once_with(False)
+    fake_job.sync_all.assert_called_once_with(False, ANY)
 
 
 def test_pii_vault_sync_force_full_scan_true_is_passed_through():
@@ -75,7 +78,25 @@ def test_pii_vault_sync_force_full_scan_true_is_passed_through():
         response = TestClient(_make_app()).post("/api/v1/pii-vault-sync", json={"force_full_scan": True})
 
     assert response.status_code == 200
-    fake_job.sync_all.assert_called_once_with(True)
+    fake_job.sync_all.assert_called_once_with(True, ANY)
+
+
+def test_pii_vault_sync_degrades_gracefully_when_creating_the_sync_run_fails():
+    """A Key Vault hiccup while creating the sync_runs record must never
+    fail the sync itself -- it degrades to no progress bar (runId: null),
+    and sync_all/finalize are called with/without a run_id accordingly."""
+    fake_job = MagicMock()
+    fake_job.sync_all.return_value = []
+    fake_job.vault.create_sync_run.side_effect = RuntimeError("Key Vault unreachable")
+
+    with patch("app.api.discovery.PiiVaultSyncJob", return_value=fake_job):
+        response = TestClient(_make_app()).post("/api/v1/pii-vault-sync")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["runId"] is None
+    fake_job.sync_all.assert_called_once_with(False, None)
+    fake_job.vault.finalize_sync_run_total.assert_not_called()
 
 
 def test_pii_vault_sync_chunk_decodes_the_pubsub_envelope_and_calls_process_chunk():
@@ -90,7 +111,20 @@ def test_pii_vault_sync_chunk_decodes_the_pubsub_envelope_and_calls_process_chun
     assert response.status_code == 200
     body = response.json()
     assert body == {"status": "ok", "resource_id": payload["resource_id"], "users_synced": 3}
-    fake_job.process_chunk.assert_called_once_with(payload["resource_id"], payload["user_ids"])
+    fake_job.process_chunk.assert_called_once_with(payload["resource_id"], payload["user_ids"], None)
+
+
+def test_pii_vault_sync_chunk_forwards_run_id_from_the_payload():
+    fake_job = MagicMock()
+    fake_job.process_chunk.return_value = 1
+
+    payload = {"resource_id": "bigquery:proj.dataset.federated_user", "user_ids": ["u1"], "run_id": "run-abc"}
+
+    with patch("app.api.discovery.PiiVaultSyncJob", return_value=fake_job):
+        response = TestClient(_make_app()).post("/api/v1/pii-vault-sync-chunk", json=_pubsub_envelope(payload))
+
+    assert response.status_code == 200
+    fake_job.process_chunk.assert_called_once_with(payload["resource_id"], payload["user_ids"], "run-abc")
 
 
 def test_pii_vault_sync_chunk_acks_a_malformed_message_instead_of_retrying_forever():
