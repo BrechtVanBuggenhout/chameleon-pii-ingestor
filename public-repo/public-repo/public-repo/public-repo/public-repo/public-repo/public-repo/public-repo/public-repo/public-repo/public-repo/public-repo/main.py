@@ -10,6 +10,7 @@ from google.cloud import pubsub_v1
 from app.pipelines.ingestion import USER_SCHEMA
 from app.api import discovery
 from app.api import source_staleness
+from app.api import version as version_api
 from app.config import settings
 from app.services.vault_client import VaultClient
 from app.services.bigquery_client import BigQueryService
@@ -85,6 +86,7 @@ app = FastAPI(
 
 app.include_router(discovery.router, prefix="/api/v1", tags=["Discovery"])
 app.include_router(source_staleness.router, prefix="/api/v1", tags=["Source Staleness"])
+app.include_router(version_api.router, tags=["Version"])
 
 @app.get("/health")
 async def health_check():

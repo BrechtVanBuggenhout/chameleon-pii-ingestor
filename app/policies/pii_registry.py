@@ -54,6 +54,16 @@ class RegistryResource:
     allowed_direct_identifiers: List[str]
     columns: List[RegistryColumn]
     user_id_column: Optional[str] = None
+    # Only meaningful for system == "pubsub". pubsub_allowed_caller_service_account
+    # is the numeric unique ID (JWT "sub" claim, never the email) of the
+    # service account the customer's own push subscription authenticates
+    # as -- the entire authorization boundary for the pubsub-ingest
+    # endpoint, which is otherwise publicly reachable (see that endpoint's
+    # own docs for why). user_id_field_path is the pubsub equivalent of
+    # user_id_column: a dotted JSON path into each message's decoded body
+    # (e.g. "after.user_id"), since there's no real "column" to name.
+    pubsub_allowed_caller_service_account: Optional[str] = None
+    user_id_field_path: Optional[str] = None
     system: Optional[str] = None
     owner_connector: Optional[str] = None
     lineage_destination: Optional[str] = None
@@ -92,6 +102,10 @@ class RegistryResource:
             tenant_scoped=bool(data.get("tenantScoped", data.get("tenant_scoped", bool(tenant_id_column)))),
             tenant_id_column=tenant_id_column,
             user_id_column=user_id_column,
+            pubsub_allowed_caller_service_account=(
+                data.get("pubsubAllowedCallerServiceAccount") or data.get("pubsub_allowed_caller_service_account")
+            ),
+            user_id_field_path=data.get("userIdFieldPath") or data.get("user_id_field_path"),
             allowed_direct_identifiers=list(
                 data.get("allowedDirectIdentifiers", data.get("allowed_direct_identifiers", []))
             ),
@@ -132,6 +146,8 @@ class RegistryResource:
             return "bigquery_table"
         if resolved_system == "gcs":
             return "gcs_prefix"
+        if resolved_system == "pubsub":
+            return "pubsub_topic"
         return resolved_system or "external"
 
     @property

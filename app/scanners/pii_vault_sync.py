@@ -1,19 +1,17 @@
 import base64
 import json
 import logging
-import os
 import re
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
-from google.api_core.exceptions import TooManyRequests
 from google.cloud import bigquery
 
 from app.core.crypto import ChameleonCrypto
 from app.policies.pii_registry import PiiMetadataRegistry, RegistryResource
 from app.scanners.encrypted_copy_writer import EncryptedCopyWriter
+from app.services.bigquery_streaming_insert import insert_with_retry
 from app.services.vault_client import VaultClient
 
 logger = logging.getLogger(__name__)
@@ -378,7 +376,7 @@ WHERE CAST({resource.user_id_column} AS STRING) IN UNNEST(@user_ids)
                         "key_id": context.get("key_id"),
                         "token": ChameleonCrypto.generate_token(context["dek"], value),
                         "encrypted_value": base64.b64encode(
-                            self._encrypt_field(context, user_id, value)
+                            ChameleonCrypto.encrypt_field_bundle(context, user_id, value)
                         ).decode("utf-8"),
                         "synced_at": now_iso,
                     }
@@ -431,37 +429,8 @@ WHERE resource_id = @resource_id
             existing.setdefault(row["user_id"], set()).add(row["field_name"])
         return existing
 
-    def _encrypt_field(self, context: Dict[str, Any], user_id: str, value: str) -> bytes:
-        """Same bundle format as ingestion.py's _encrypt_field: `key_id:iv_b64:ciphertext_b64`,
-        so anything that already knows how to decrypt raw_users.pii_fields can decrypt
-        pii_vault's encrypted_value identically."""
-        iv = os.urandom(12)
-        raw_bundle_b64 = ChameleonCrypto.encrypt(context["dek"], user_id, value, iv=iv)
-        raw_bundle = base64.b64decode(raw_bundle_b64)
-        ciphertext_only = raw_bundle[12:]
-        iv_b64 = base64.b64encode(iv).decode("utf-8")
-        ciphertext_b64 = base64.b64encode(ciphertext_only).decode("utf-8")
-        return f"{context['key_id']}:{iv_b64}:{ciphertext_b64}".encode("utf-8")
-
     def _load_vault_records(self, records: List[Dict[str, Any]]) -> None:
         table_ref = f"{self.vault_project_id}.{self.vault_dataset_id}.{self.VAULT_TABLE_ID}"
-        for attempt in range(1, self.LOAD_MAX_RETRIES + 1):
-            try:
-                errors = self.bigquery_client.insert_rows_json(table_ref, records)
-                if errors:
-                    # Per-row validation errors (e.g. a schema mismatch) --
-                    # distinct from a request-level TooManyRequests below.
-                    # Retrying these would just fail identically, so this is
-                    # a real, non-retryable failure for this chunk.
-                    raise RuntimeError(f"BigQuery streaming insert reported row errors: {errors}")
-                logger.info(f"Synced {len(records)} fields into {table_ref}")
-                return
-            except TooManyRequests:
-                if attempt == self.LOAD_MAX_RETRIES:
-                    raise
-                delay = self.LOAD_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                logger.warning(
-                    f"pii_vault streaming insert rate-limited (attempt {attempt}/{self.LOAD_MAX_RETRIES}), "
-                    f"retrying in {delay}s"
-                )
-                time.sleep(delay)
+        insert_with_retry(
+            self.bigquery_client, table_ref, records, self.LOAD_MAX_RETRIES, self.LOAD_BASE_BACKOFF_SECONDS
+        )
