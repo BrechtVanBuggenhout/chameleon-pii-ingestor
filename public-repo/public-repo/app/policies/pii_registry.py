@@ -67,6 +67,14 @@ class RegistryResource:
     # full-scan behavior every other resource has always had.
     updated_at_column: Optional[str] = None
     last_synced_at: Optional[str] = None
+    # Zero or more of REDACT_IN_PLACE / SHADOW_COPY / ENCRYPTED_COPY,
+    # independently combinable -- mirrors chameleon-key-vault's
+    # resolveSourceRedactionStrategies(): the array field if the registry
+    # entry has one, else the legacy singular sourceRedactionStrategy field
+    # wrapped in a list (dropping 'NONE', which is only ever that field's
+    # "nothing" value). See source-redaction-strategies.ts for the
+    # TypeScript original this must stay behaviorally identical to.
+    source_redaction_strategies: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RegistryResource":
@@ -100,7 +108,16 @@ class RegistryResource:
             registry_version=data.get("registryVersion") or data.get("registry_version"),
             updated_at_column=data.get("updatedAtColumn") or data.get("updated_at_column"),
             last_synced_at=data.get("lastSyncedAt") or data.get("last_synced_at"),
+            source_redaction_strategies=cls._resolve_source_redaction_strategies(data),
         )
+
+    @staticmethod
+    def _resolve_source_redaction_strategies(data: Dict[str, Any]) -> List[str]:
+        strategies = data.get("sourceRedactionStrategies")
+        if strategies is not None:
+            return list(strategies)
+        legacy = data.get("sourceRedactionStrategy") or data.get("source_redaction_strategy")
+        return [legacy] if legacy and legacy != "NONE" else []
 
     @staticmethod
     def _system_from_resource(resource_id: str) -> Optional[str]:
@@ -123,6 +140,9 @@ class RegistryResource:
 
     def column_names(self) -> List[str]:
         return [column.name for column in self.columns]
+
+    def wants_encrypted_copy(self) -> bool:
+        return "ENCRYPTED_COPY" in self.source_redaction_strategies
 
 
 class PiiMetadataRegistry:

@@ -228,9 +228,9 @@ WHERE {resource.user_id_column} IS NOT NULL
 
         # Only reached if every chunk above published successfully -- an
         # exception mid-loop propagates up to sync_all's own per-resource
-        # try/except instead, which deliberately does NOT advance the
-        # watermark, so a partially-failed run gets fully retried next time
-        # rather than silently skipping whatever it didn't get to.
+        # try/except instead, which deliberately does NOT advance either
+        # timestamp below, so a partially-failed run gets fully retried next
+        # time rather than silently skipping whatever it didn't get to.
         if resource.updated_at_column:
             try:
                 self.vault.mark_resource_synced(resource.id, job_start_time.isoformat())
@@ -239,6 +239,15 @@ WHERE {resource.user_id_column} IS NOT NULL
                 # a Key Vault write hiccup into a "sync failed" result. Worst
                 # case, the next run just re-scans this resource once more.
                 logger.error(f"Failed to advance sync watermark for {resource.id}: {e}")
+
+        # Unconditional, unlike the incremental watermark above -- a
+        # resource with no updatedAtColumn still genuinely syncs (real
+        # chunks just got published above) but would otherwise never
+        # advance any sync-status signal at all.
+        try:
+            self.vault.mark_resource_sync_attempted(resource.id, job_start_time.isoformat())
+        except Exception as e:
+            logger.error(f"Failed to record sync attempt for {resource.id}: {e}")
 
         return chunks_queued
 

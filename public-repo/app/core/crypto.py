@@ -51,3 +51,27 @@ class ChameleonCrypto:
         key = bytes.fromhex(token_key_hex)
         h = hmac.new(key, plaintext.encode(), hashlib.sha256)
         return h.hexdigest()
+
+    @staticmethod
+    def encrypt_field_bundle(context: dict, user_id: str, value: str) -> bytes:
+        """
+        The canonical `key_id:iv_b64:ciphertext_b64` bundle format used
+        everywhere pii_vault's `encrypted_value` column (or an equivalent,
+        e.g. raw_users.encrypted_pii) is written -- ingestion.py,
+        pii_vault_sync.py, and the pubsub ingest path all need byte-
+        identical output so anything that decrypts one can decrypt any of
+        them. Was duplicated (byte-for-byte) in ingestion.py and
+        pii_vault_sync.py before this; extracted here as the single real
+        implementation rather than adding a third copy.
+
+        Fresh random IV per call (`encrypt`'s own default) -- safe to call
+        once per declared field for the same user/DEK, same reasoning as
+        every existing call site already relied on.
+        """
+        iv = os.urandom(12)
+        raw_bundle_b64 = ChameleonCrypto.encrypt(context["dek"], user_id, value, iv=iv)
+        raw_bundle = base64.b64decode(raw_bundle_b64)
+        ciphertext_only = raw_bundle[12:]
+        iv_b64 = base64.b64encode(iv).decode("utf-8")
+        ciphertext_b64 = base64.b64encode(ciphertext_only).decode("utf-8")
+        return f"{context['key_id']}:{iv_b64}:{ciphertext_b64}".encode("utf-8")
