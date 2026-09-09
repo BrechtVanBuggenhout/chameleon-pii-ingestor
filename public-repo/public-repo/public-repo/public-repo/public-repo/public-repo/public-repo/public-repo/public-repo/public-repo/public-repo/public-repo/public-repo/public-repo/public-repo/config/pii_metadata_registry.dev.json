@@ -1,0 +1,113 @@
+{
+  "version": 1,
+  "resources": [
+    {
+      "id": "bigquery:chameleon_dev.stg_users",
+      "type": "bigquery_table",
+      "tenantScoped": true,
+      "tenantIdColumn": "tenant_id",
+      "allowedDirectIdentifiers": [],
+      "columns": [
+        {
+          "name": "user_id",
+          "classification": "TOKENIZED_IDENTIFIER",
+          "identifierType": "USER_ID",
+          "allowedInMart": true
+        },
+        {
+          "name": "tenant_id",
+          "classification": "SYSTEM_METADATA",
+          "allowedInMart": true
+        },
+        {
+          "name": "email_token",
+          "classification": "TOKENIZED_IDENTIFIER",
+          "identifierType": "EMAIL_TOKEN",
+          "allowedInMart": true
+        },
+        {
+          "name": "encrypted_pii",
+          "classification": "ENCRYPTED_PII",
+          "allowedInMart": false
+        }
+      ]
+    },
+    {
+      "id": "bigquery:lineage_db.events",
+      "type": "bigquery_table",
+      "tenantScoped": true,
+      "tenantIdColumn": "tenant_id",
+      "allowedDirectIdentifiers": [],
+      "columns": [
+        {
+          "name": "user_id",
+          "classification": "TOKENIZED_IDENTIFIER",
+          "identifierType": "USER_ID",
+          "allowedInMart": true
+        },
+        {
+          "name": "tenant_id",
+          "classification": "SYSTEM_METADATA",
+          "allowedInMart": true
+        },
+        {
+          "name": "source",
+          "classification": "LINEAGE_METADATA",
+          "allowedInMart": true
+        },
+        {
+          "name": "destination",
+          "classification": "LINEAGE_METADATA",
+          "allowedInMart": true
+        },
+        {
+          "name": "context",
+          "classification": "LINEAGE_METADATA",
+          "allowedInMart": true
+        }
+      ]
+    },
+    {
+      "id": "gcs:gs://chameleon-dev-landing-zone/",
+      "type": "gcs_prefix",
+      "tenantScoped": true,
+      "tenantIdColumn": null,
+      "allowedDirectIdentifiers": ["email"],
+      "columns": [
+        {
+          "name": "email",
+          "classification": "DIRECT_IDENTIFIER",
+          "identifierType": "EMAIL",
+          "allowedInMart": false
+        },
+        {
+          "name": "user_id",
+          "classification": "TOKENIZED_IDENTIFIER",
+          "identifierType": "USER_ID",
+          "allowedInMart": true
+        }
+      ]
+    },
+    {
+      "id": "gcs:gs://chameleon-dev-landing-zone/ingestion-tests/",
+      "type": "gcs_prefix",
+      "tenantScoped": true,
+      "tenantIdColumn": null,
+      "allowedDirectIdentifiers": ["email"],
+      "columns": [
+        {
+          "name": "email",
+          "classification": "DIRECT_IDENTIFIER",
+          "identifierType": "EMAIL",
+          "allowedInMart": false
+        },
+        {
+          "name": "user_id",
+          "classification": "TOKENIZED_IDENTIFIER",
+          "identifierType": "USER_ID",
+          "allowedInMart": true
+        }
+      ]
+    }
+  ]
+}

@@ -6,8 +6,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastavro import schemaless_reader
+from google.cloud import pubsub_v1
 from app.pipelines.ingestion import USER_SCHEMA
 from app.api import discovery
+from app.api import source_staleness
+from app.api import version as version_api
 from app.config import settings
 from app.services.vault_client import VaultClient
 from app.services.bigquery_client import BigQueryService
@@ -19,6 +22,18 @@ from app.services.gcs_monitor import GCSLandingZoneMonitor
 from app.scanners.warehouse_metadata_crawler import normalize_bigquery_resource_id
 
 logger = logging.getLogger(__name__)
+
+
+class _HealthCheckLogFilter(logging.Filter):
+    """Drops uvicorn's access-log line for /health -- hit continuously by
+    Cloud Run's own health probes, not real traffic, and drowns out real
+    request logs in prod."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/health" not in record.getMessage()
+
+
+logging.getLogger("uvicorn.access").addFilter(_HealthCheckLogFilter())
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -36,12 +51,18 @@ async def lifespan(app: FastAPI):
         gcs_service=gcs
     )
     
+    pii_vault_sync_publisher = pubsub_v1.PublisherClient()
+
     # Store for DI
     app.state.vault = vault
     app.state.pipeline = pipeline
     app.state.bq = bq
     app.state.warehouse_writer = warehouse_writer
     app.state.gcs = gcs
+    app.state.pii_vault_sync_publisher = pii_vault_sync_publisher
+    # Fully-qualified already (projects/<id>/topics/<name>), matching
+    # PII_TOPIC_ID/LINEAGE_TOPIC_ID's own convention -- not a short topic ID.
+    app.state.pii_vault_sync_chunk_topic_path = settings.PII_VAULT_SYNC_CHUNK_TOPIC_ID
 
     # Identifies the PII registry declaration for bulk file drops -- matches
     # the resourceId convention the console/Key Vault registry already uses
@@ -76,6 +97,8 @@ app = FastAPI(
 )
 
 app.include_router(discovery.router, prefix="/api/v1", tags=["Discovery"])
+app.include_router(source_staleness.router, prefix="/api/v1", tags=["Source Staleness"])
+app.include_router(version_api.router, tags=["Version"])
 
 @app.get("/health")
 async def health_check():
