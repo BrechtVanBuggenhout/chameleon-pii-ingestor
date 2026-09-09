@@ -423,17 +423,6 @@ class VaultClient:
             self.logger.debug(f"ℹ️ Certificate not found for {user_id} at {url}")
             return None
 
-    def decrypt_remote(self, user_id: str, ciphertext: str) -> str:
-        """Fallback for smaller batches or Reverse ETL flow."""
-        try:
-            url = f"{self.base_url}/decrypt"
-            res = self.session.post(url, json={"userId": user_id, "tenantId": self.tenant_id, "ciphertext": ciphertext})
-            res.raise_for_status()
-            return res.json()['plaintext']
-        except Exception as e:
-            self.logger.error(f"❌ Remote decryption failed for {user_id} at {url}: {e}")
-            raise
-
     def shred_key(self, user_id: str, deletion_request_id: str, operation_id: str) -> Dict[str, Any]:
         """
         Triggers a key shred operation in the Vault.
