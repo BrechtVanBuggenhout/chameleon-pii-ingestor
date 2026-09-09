@@ -111,21 +111,21 @@ class PiiVaultSyncJob:
         self.publisher = publisher
         self.chunk_topic_path = chunk_topic_path
 
-    def sync_all(self) -> List[VaultSyncResult]:
+    def sync_all(self, force_full_scan: bool = False) -> List[VaultSyncResult]:
         registry_data = self.vault.fetch_pii_registry_resources(owner_connector="manual")
         registry = PiiMetadataRegistry.from_api_response(registry_data)
 
         results: List[VaultSyncResult] = []
         for resource in registry.resources:
             try:
-                count = self.enumerate_resource(resource)
+                count = self.enumerate_resource(resource, force_full_scan=force_full_scan)
                 results.append(VaultSyncResult(resource_id=resource.id, chunks_queued=count))
             except Exception as e:
                 logger.error(f"Failed to enumerate {resource.id} for pii_vault sync: {e}")
                 results.append(VaultSyncResult(resource_id=resource.id, chunks_queued=0, error=str(e)))
         return results
 
-    def enumerate_resource(self, resource: RegistryResource) -> int:
+    def enumerate_resource(self, resource: RegistryResource, force_full_scan: bool = False) -> int:
         if resource.system != "bigquery":
             logger.info(f"Skipping {resource.id} -- only bigquery sources are supported today")
             return 0
@@ -140,17 +140,43 @@ class PiiVaultSyncJob:
 
         project_id, dataset_id, table_id = parse_bigquery_resource_id(resource.id)
 
-        query = f"""
+        # Captured before the query runs, not after -- once a BigQuery query
+        # job starts, its result set is fixed for the life of that job, so
+        # any row committed after this point is guaranteed to be picked up
+        # by the >= filter next run, never silently lost to mid-scan drift.
+        job_start_time = datetime.now(timezone.utc)
+
+        incremental = bool(not force_full_scan and resource.updated_at_column and resource.last_synced_at)
+        if incremental:
+            # >= not > -- a strict > has a permanent-miss failure mode if a
+            # row's updated_at is ever exactly equal to a previously-captured
+            # watermark (e.g. a coarse or shared clock in the customer's own
+            # ETL). _fetch_existing_fields' per-user-per-field idempotency
+            # already absorbs the resulting reprocessed-row overlap for free.
+            query = f"""
+SELECT {resource.user_id_column}
+FROM `{project_id}.{dataset_id}.{table_id}`
+WHERE {resource.user_id_column} IS NOT NULL
+  AND {resource.updated_at_column} >= @last_synced_at
+"""
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("last_synced_at", "TIMESTAMP", resource.last_synced_at)
+                ]
+            )
+            row_iterator = self.bigquery_client.query(query, job_config=job_config).result()
+        else:
+            query = f"""
 SELECT {resource.user_id_column}
 FROM `{project_id}.{dataset_id}.{table_id}`
 WHERE {resource.user_id_column} IS NOT NULL
 """
-        # Deliberately NOT wrapped in list(...) -- same reasoning as the old
-        # single-phase design: page results in from the API as we go rather
-        # than holding the whole table at once. Much cheaper here regardless,
-        # since each row is now just one ID string, not a full row of PII
-        # field values plus encryption context.
-        row_iterator = self.bigquery_client.query(query).result()
+            # Deliberately NOT wrapped in list(...) -- same reasoning as the
+            # old single-phase design: page results in from the API as we go
+            # rather than holding the whole table at once. Much cheaper here
+            # regardless, since each row is now just one ID string, not a
+            # full row of PII field values plus encryption context.
+            row_iterator = self.bigquery_client.query(query).result()
 
         chunks_queued = 0
         chunk: List[str] = []
@@ -163,6 +189,20 @@ WHERE {resource.user_id_column} IS NOT NULL
         if chunk:
             self._publish_chunk(resource.id, chunk)
             chunks_queued += 1
+
+        # Only reached if every chunk above published successfully -- an
+        # exception mid-loop propagates up to sync_all's own per-resource
+        # try/except instead, which deliberately does NOT advance the
+        # watermark, so a partially-failed run gets fully retried next time
+        # rather than silently skipping whatever it didn't get to.
+        if resource.updated_at_column:
+            try:
+                self.vault.mark_resource_synced(resource.id, job_start_time.isoformat())
+            except Exception as e:
+                # A full BigQuery scan already succeeded above -- don't turn
+                # a Key Vault write hiccup into a "sync failed" result. Worst
+                # case, the next run just re-scans this resource once more.
+                logger.error(f"Failed to advance sync watermark for {resource.id}: {e}")
 
         return chunks_queued
 

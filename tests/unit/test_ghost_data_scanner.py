@@ -56,6 +56,81 @@ def test_scanner_detects_ghost_data_without_emitting_raw_pii():
         assert "+1 415 555 0100" not in str(call.kwargs)
 
 
+def test_scanner_detects_email_nested_inside_json_object_column():
+    # BigQuery's client returns JSON/STRUCT columns as native dict values.
+    # An email a couple of keys deep must still be found, and the finding's
+    # column must be marked "(json)" so a reviewer can tell it wasn't a
+    # plain STRING column that happened to look like an email.
+    registry = PiiMetadataRegistry.load("config/pii_metadata_registry.dev.json")
+    bq = FakeBigQueryClient(
+        [
+            {
+                "user_id": "user-1",
+                "tenant_id": "tenant-a",
+                "attributes": {"contact": {"backup_email": "leaked-json@example.com"}, "note": "n/a"},
+            },
+        ]
+    )
+    vault = MagicMock()
+
+    findings = BigQueryGhostDataScanner(
+        bigquery_client=bq,
+        registry=registry,
+        vault=vault,
+    ).scan(["bigquery:chameleon_dev.stg_users"])
+
+    assert [(f.column, f.pattern, f.sample_count) for f in findings] == [("attributes (json)", "EMAIL", 1)]
+    for call in vault.report_lineage.call_args_list:
+        assert "leaked-json@example.com" not in str(call.kwargs)
+
+
+def test_scanner_detects_phone_inside_json_array_column():
+    # REPEATED/ARRAY columns come back as native list values -- a
+    # phone-shaped leaf nested inside a list of objects must still be found.
+    registry = PiiMetadataRegistry.load("config/pii_metadata_registry.dev.json")
+    bq = FakeBigQueryClient(
+        [
+            {
+                "user_id": "user-1",
+                "tenant_id": "tenant-a",
+                "attributes": [{"kind": "mobile", "value": "+1 415 555 0100"}, {"kind": "fax", "value": None}],
+            },
+        ]
+    )
+    vault = MagicMock()
+
+    findings = BigQueryGhostDataScanner(
+        bigquery_client=bq,
+        registry=registry,
+        vault=vault,
+    ).scan(["bigquery:chameleon_dev.stg_users"])
+
+    assert [(f.column, f.pattern, f.sample_count) for f in findings] == [("attributes (json)", "PHONE", 1)]
+
+
+def test_scanner_reports_no_findings_for_benign_json_object_column():
+    registry = PiiMetadataRegistry.load("config/pii_metadata_registry.dev.json")
+    bq = FakeBigQueryClient(
+        [
+            {
+                "user_id": "user-1",
+                "tenant_id": "tenant-a",
+                "attributes": {"plan": "pro", "seats": 5, "active": True, "note": "nothing sensitive here"},
+            },
+        ]
+    )
+    vault = MagicMock()
+
+    findings = BigQueryGhostDataScanner(
+        bigquery_client=bq,
+        registry=registry,
+        vault=vault,
+    ).scan(["bigquery:chameleon_dev.stg_users"])
+
+    assert findings == []
+    vault.report_lineage.assert_not_called()
+
+
 def test_scanner_uses_key_vault_registry_scope_and_metadata_contract():
     vault = MagicMock()
     vault.fetch_pii_registry_resources.return_value = {

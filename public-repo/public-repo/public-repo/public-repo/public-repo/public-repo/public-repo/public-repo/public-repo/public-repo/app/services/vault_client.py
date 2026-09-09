@@ -308,6 +308,22 @@ class VaultClient:
         res.raise_for_status()
         return res.json()
 
+    def mark_resource_sync_attempted(self, resource_id: str, attempted_at_iso: str) -> Dict[str, Any]:
+        """
+        Records that a sync run genuinely completed for this resource --
+        called after *every* successful enumerate_resource(), unlike
+        mark_resource_synced above, which only ever runs for resources with
+        updatedAtColumn set. A resource with no updatedAtColumn syncs real
+        data on every run but never advances that watermark, which made the
+        registry UI permanently show "Never synced" for it regardless of
+        how many times it actually ran.
+        """
+        encoded_resource_id = quote(resource_id, safe="")
+        url = f"{self.base_url}/pii-registry/resources/{encoded_resource_id}/mark-sync-attempted"
+        res = self.session.post(url, json={"lastSyncAttemptAt": attempted_at_iso})
+        res.raise_for_status()
+        return res.json()
+
     def fetch_pii_registry_policy(self) -> Dict[str, Any]:
         """
         Reads the coarse PII registry policy status for dbt/demo checks.

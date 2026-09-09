@@ -94,7 +94,15 @@ class BigQueryGhostDataScanner:
                 if pattern and enabled_patterns and pattern not in enabled_patterns:
                     continue
                 if pattern:
-                    counts[(column, pattern)] = counts.get((column, pattern), 0) + 1
+                    # Marks findings that came from inside a JSON/STRUCT
+                    # blob rather than a plain STRING column -- column is a
+                    # pure display string downstream (never a SQL
+                    # identifier, see GHOST_DATA_DETECTED's consumers), so
+                    # suffixing it here is safe. Stage 1 deliberately
+                    # doesn't identify *which* nested key matched, only
+                    # that the column contains PII somewhere.
+                    display_column = f"{column} (json)" if isinstance(value, (dict, list)) else column
+                    counts[(display_column, pattern)] = counts.get((display_column, pattern), 0) + 1
 
         return [
             GhostFinding(
@@ -107,6 +115,24 @@ class BigQueryGhostDataScanner:
         ]
 
     def _classify_value(self, value: Any) -> Optional[str]:
+        # JSON/STRUCT columns come back from the BigQuery client as dict
+        # (object) or list (array) values -- walk their leaf strings rather
+        # than requiring the whole value to look like an email/phone/name
+        # itself (which json.dumps()-then-match would need, and never
+        # would: EMAIL_RE etc. are anchored ^...$ full-string matches, so a
+        # serialized {"backup_email": "x@y.com"} blob can never satisfy
+        # them). Plain STRING columns take the same path as before,
+        # unchanged: _classify_scalar is _classify_value's old body
+        # verbatim.
+        if isinstance(value, (dict, list)):
+            for leaf in self._iter_leaf_strings(value):
+                pattern = self._classify_scalar(leaf)
+                if pattern:
+                    return pattern
+            return None
+        return self._classify_scalar(value)
+
+    def _classify_scalar(self, value: Any) -> Optional[str]:
         if not isinstance(value, str):
             return None
         stripped = value.strip()
@@ -117,6 +143,16 @@ class BigQueryGhostDataScanner:
         if NAME_RE.match(stripped):
             return "NAME"
         return None
+
+    def _iter_leaf_strings(self, value: Any) -> Iterable[str]:
+        if isinstance(value, dict):
+            for v in value.values():
+                yield from self._iter_leaf_strings(v)
+        elif isinstance(value, list):
+            for v in value:
+                yield from self._iter_leaf_strings(v)
+        elif isinstance(value, str):
+            yield value
 
     def _emit_finding(self, finding: GhostFinding) -> None:
         resource = self.registry.get(finding.resource_id)

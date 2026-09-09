@@ -122,21 +122,23 @@ class PiiVaultSyncJob:
         self.publisher = publisher
         self.chunk_topic_path = chunk_topic_path
 
-    def sync_all(self, force_full_scan: bool = False) -> List[VaultSyncResult]:
+    def sync_all(self, force_full_scan: bool = False, run_id: Optional[str] = None) -> List[VaultSyncResult]:
         registry_data = self.vault.fetch_pii_registry_resources(owner_connector="manual")
         registry = PiiMetadataRegistry.from_api_response(registry_data)
 
         results: List[VaultSyncResult] = []
         for resource in registry.resources:
             try:
-                count = self.enumerate_resource(resource, force_full_scan=force_full_scan)
+                count = self.enumerate_resource(resource, force_full_scan=force_full_scan, run_id=run_id)
                 results.append(VaultSyncResult(resource_id=resource.id, chunks_queued=count))
             except Exception as e:
                 logger.error(f"Failed to enumerate {resource.id} for pii_vault sync: {e}")
                 results.append(VaultSyncResult(resource_id=resource.id, chunks_queued=0, error=str(e)))
         return results
 
-    def sync_one(self, resource_id: str, force_full_scan: bool = False) -> VaultSyncResult:
+    def sync_one(
+        self, resource_id: str, force_full_scan: bool = False, run_id: Optional[str] = None
+    ) -> VaultSyncResult:
         """
         Same as sync_all, scoped to a single declared resource -- backs the
         console's per-resource Sync Now action so re-syncing one large,
@@ -155,13 +157,15 @@ class PiiVaultSyncJob:
                     chunks_queued=0,
                     error="Sync Now only applies to manually-declared resources",
                 )
-            count = self.enumerate_resource(resource, force_full_scan=force_full_scan)
+            count = self.enumerate_resource(resource, force_full_scan=force_full_scan, run_id=run_id)
             return VaultSyncResult(resource_id=resource.id, chunks_queued=count)
         except Exception as e:
             logger.error(f"Failed to enumerate {resource_id} for pii_vault sync: {e}")
             return VaultSyncResult(resource_id=resource_id, chunks_queued=0, error=str(e))
 
-    def enumerate_resource(self, resource: RegistryResource, force_full_scan: bool = False) -> int:
+    def enumerate_resource(
+        self, resource: RegistryResource, force_full_scan: bool = False, run_id: Optional[str] = None
+    ) -> int:
         if resource.system != "bigquery":
             logger.info(f"Skipping {resource.id} -- only bigquery sources are supported today")
             return 0
@@ -219,11 +223,11 @@ WHERE {resource.user_id_column} IS NOT NULL
         for row in row_iterator:
             chunk.append(str(row[resource.user_id_column]))
             if len(chunk) >= self.CHUNK_SIZE:
-                self._publish_chunk(resource.id, chunk)
+                self._publish_chunk(resource.id, chunk, run_id=run_id)
                 chunks_queued += 1
                 chunk = []
         if chunk:
-            self._publish_chunk(resource.id, chunk)
+            self._publish_chunk(resource.id, chunk, run_id=run_id)
             chunks_queued += 1
 
         # Only reached if every chunk above published successfully -- an
@@ -251,15 +255,29 @@ WHERE {resource.user_id_column} IS NOT NULL
 
         return chunks_queued
 
-    def _publish_chunk(self, resource_id: str, user_ids: List[str]) -> None:
-        payload = json.dumps({"resource_id": resource_id, "user_ids": user_ids}).encode("utf-8")
+    def _publish_chunk(self, resource_id: str, user_ids: List[str], run_id: Optional[str] = None) -> None:
+        payload_dict: Dict[str, Any] = {"resource_id": resource_id, "user_ids": user_ids}
+        if run_id:
+            payload_dict["run_id"] = run_id
+        payload = json.dumps(payload_dict).encode("utf-8")
         future = self.publisher.publish(self.chunk_topic_path, payload)
         # Block for the publish to actually succeed rather than fire-and-forget --
         # a silently dropped chunk means those users never get synced at all,
         # with nothing left to retry them.
         future.result()
 
-    def process_chunk(self, resource_id: str, user_ids: List[str]) -> int:
+    def process_chunk(self, resource_id: str, user_ids: List[str], run_id: Optional[str] = None) -> int:
+        try:
+            result = self._process_chunk_inner(resource_id, user_ids)
+        except Exception:
+            if run_id:
+                self.vault.record_sync_chunk_outcome(run_id, "failed")
+            raise
+        if run_id:
+            self.vault.record_sync_chunk_outcome(run_id, "completed")
+        return result
+
+    def _process_chunk_inner(self, resource_id: str, user_ids: List[str]) -> int:
         registry_data = self.vault.fetch_pii_registry_resources(owner_connector="manual")
         registry = PiiMetadataRegistry.from_api_response(registry_data)
         resource = next((r for r in registry.resources if r.id == resource_id), None)

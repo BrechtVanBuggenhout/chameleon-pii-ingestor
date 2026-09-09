@@ -54,6 +54,14 @@ class Settings(BaseSettings):
     WAREHOUSE_DISCOVERY_DATASETS: str = ""
     WAREHOUSE_DISCOVERY_SAMPLE_LIMIT: int = 1000
     WAREHOUSE_DISCOVERY_EXCLUDED_TABLE_PATTERNS: str = ""
+    # Where the chameleon_pii dbt package's pii_discovery table(s) live -- one
+    # "project.dataset" entry per dbt target/environment that runs the package.
+    # A bare "dataset" (no dot) resolves against DBT_PII_DISCOVERY_PROJECT_ID /
+    # GOOGLE_CLOUD_PROJECT. Empty = publishing dbt's discovery findings into the
+    # console's live discovery feed is off; it's an opt-in feature like warehouse
+    # discovery above, not core path.
+    DBT_PII_DISCOVERY_PROJECT_ID: Optional[str] = None
+    DBT_PII_DISCOVERY_DATASETS: str = ""
     KMS_SIGNING_PROJECT_ID: str
     KMS_SIGNING_KEY_RING: str
     KMS_SIGNING_KEY_NAME: str
@@ -76,6 +84,10 @@ class Settings(BaseSettings):
     @property
     def warehouse_discovery_project_id_resolved(self) -> str:
         return self.WAREHOUSE_DISCOVERY_PROJECT_ID or self.GOOGLE_CLOUD_PROJECT
+
+    @property
+    def dbt_pii_discovery_project_id_resolved(self) -> str:
+        return self.DBT_PII_DISCOVERY_PROJECT_ID or self.GOOGLE_CLOUD_PROJECT
 
     @property
     def staging_dataset_resolved(self) -> str:

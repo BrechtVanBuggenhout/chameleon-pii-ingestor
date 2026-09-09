@@ -196,7 +196,7 @@ class TestEncryptedCopyWriterAppend:
         assert row["raw_blob"] == "hello"
 
     def test_retries_a_rate_limited_insert_and_still_appends(self, monkeypatch):
-        monkeypatch.setattr("app.scanners.encrypted_copy_writer.time.sleep", lambda _seconds: None)
+        monkeypatch.setattr("app.services.bigquery_streaming_insert.time.sleep", lambda _seconds: None)
         resource = make_resource()
         bq = FlakyBigQueryClient(raise_count=2)
         writer = EncryptedCopyWriter(bq)
@@ -211,7 +211,7 @@ class TestEncryptedCopyWriterAppend:
         assert bq.attempts == 3
 
     def test_re_raises_once_retries_are_exhausted(self, monkeypatch):
-        monkeypatch.setattr("app.scanners.encrypted_copy_writer.time.sleep", lambda _seconds: None)
+        monkeypatch.setattr("app.services.bigquery_streaming_insert.time.sleep", lambda _seconds: None)
         resource = make_resource()
         bq = FlakyBigQueryClient(raise_count=EncryptedCopyWriter.LOAD_MAX_RETRIES)
         writer = EncryptedCopyWriter(bq)

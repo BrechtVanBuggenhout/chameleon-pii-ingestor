@@ -1,15 +1,11 @@
-import logging
 import re
-import time
 from datetime import date, datetime
 from typing import Any, Dict, List
 
-from google.api_core.exceptions import TooManyRequests
 from google.cloud import bigquery
 
 from app.policies.pii_registry import RegistryResource
-
-logger = logging.getLogger(__name__)
+from app.services.bigquery_streaming_insert import insert_with_retry
 
 # Duplicated from pii_vault_sync.parse_bigquery_resource_id rather than
 # imported -- pii_vault_sync imports EncryptedCopyWriter (to wire it into
@@ -102,19 +98,6 @@ class EncryptedCopyWriter:
     def _insert(self, resource: RegistryResource, records: List[Dict[str, Any]]) -> None:
         project_id, dataset_id, table_id = _parse_bigquery_resource_id(resource.id)
         table_ref = f"{project_id}.{dataset_id}.{table_id}_encrypted_raw"
-        for attempt in range(1, self.LOAD_MAX_RETRIES + 1):
-            try:
-                errors = self.bigquery_client.insert_rows_json(table_ref, records)
-                if errors:
-                    raise RuntimeError(f"BigQuery streaming insert reported row errors: {errors}")
-                logger.info(f"Appended {len(records)} rows into {table_ref}")
-                return
-            except TooManyRequests:
-                if attempt == self.LOAD_MAX_RETRIES:
-                    raise
-                delay = self.LOAD_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                logger.warning(
-                    f"{table_ref} streaming insert rate-limited (attempt {attempt}/{self.LOAD_MAX_RETRIES}), "
-                    f"retrying in {delay}s"
-                )
-                time.sleep(delay)
+        insert_with_retry(
+            self.bigquery_client, table_ref, records, self.LOAD_MAX_RETRIES, self.LOAD_BASE_BACKOFF_SECONDS
+        )

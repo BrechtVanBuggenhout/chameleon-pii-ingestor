@@ -104,3 +104,68 @@ class TestSourceRedactionStrategiesResolution:
         resource = registry.get("bigquery:proj.dataset.contacts")
         assert resource.source_redaction_strategies == []
         assert resource.wants_encrypted_copy() is False
+
+
+class TestPubsubResource:
+    """system == 'pubsub' resources: no real column, so userIdColumn/schema
+    discovery are replaced by dotted-path field references and an
+    allowed-caller service account (the pubsub-ingest endpoint's entire
+    authorization boundary -- see that endpoint's own docs)."""
+
+    def test_resolves_pubsub_fields_from_camelCase_api_response(self):
+        registry = PiiMetadataRegistry.from_api_response(
+            {
+                "resources": [
+                    {
+                        "resourceId": "pubsub:acme-project.cdc-events",
+                        "system": "pubsub",
+                        "pubsubAllowedCallerServiceAccount": "123456789012345678901",
+                        "userIdFieldPath": "after.user_id",
+                        "piiFields": [
+                            {"name": "after.email", "classification": "DIRECT_IDENTIFIER", "handling": "ENCRYPT"}
+                        ],
+                    }
+                ]
+            }
+        )
+        resource = registry.get("pubsub:acme-project.cdc-events")
+        assert resource.system == "pubsub"
+        assert resource.type == "pubsub_topic"
+        assert resource.pubsub_allowed_caller_service_account == "123456789012345678901"
+        assert resource.user_id_field_path == "after.user_id"
+        assert resource.column_names() == ["after.email"]
+
+    def test_resolves_pubsub_fields_from_snake_case_local_registry_shape(self):
+        registry = PiiMetadataRegistry.from_api_response(
+            {
+                "resources": [
+                    {
+                        "resourceId": "pubsub:acme-project.cdc-events",
+                        "system": "pubsub",
+                        "pubsub_allowed_caller_service_account": "123456789012345678901",
+                        "user_id_field_path": "after.user_id",
+                        "piiFields": [],
+                    }
+                ]
+            }
+        )
+        resource = registry.get("pubsub:acme-project.cdc-events")
+        assert resource.pubsub_allowed_caller_service_account == "123456789012345678901"
+        assert resource.user_id_field_path == "after.user_id"
+
+    def test_fields_are_none_for_a_non_pubsub_resource(self):
+        registry = PiiMetadataRegistry.from_api_response(
+            {
+                "resources": [
+                    {
+                        "resourceId": "bigquery:proj.dataset.contacts",
+                        "system": "bigquery",
+                        "userIdColumn": "user_id",
+                        "piiFields": [],
+                    }
+                ]
+            }
+        )
+        resource = registry.get("bigquery:proj.dataset.contacts")
+        assert resource.pubsub_allowed_caller_service_account is None
+        assert resource.user_id_field_path is None

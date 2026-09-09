@@ -1,0 +1,27 @@
+# Virtual Environments
+venv/
+.venv/
+env/
+bin/
+lib/
+share/
+
+# Python Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment Variables (Sensitive)
+.env
+
+# OS Specific
+.DS_Store
+
+# Local Test Data
+*.csv
+*.json
+!config/
+!config/pii_metadata_registry.dev.json

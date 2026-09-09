@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 
 import pytest
+from google.api_core.exceptions import TooManyRequests
 
 from app.scanners.pii_vault_sync import PiiVaultSyncJob, parse_bigquery_resource_id
 
@@ -476,3 +477,83 @@ class TestProcessChunk:
 
         assert synced == 0
         assert bq.queries == []  # never even re-queries a resource that's gone
+
+
+class FlakyLoadJob:
+    """Raises TooManyRequests on .result() a configured number of times
+    before finally succeeding -- simulates BigQuery's per-table write-rate
+    quota tripping on a load job."""
+
+    def __init__(self, on_load, raise_count, call_counter):
+        self._on_load = on_load
+        self._raise_count = raise_count
+        self._call_counter = call_counter
+
+    def result(self):
+        self._call_counter[0] += 1
+        if self._call_counter[0] <= self._raise_count:
+            raise TooManyRequests("Exceeded rate limits: too many table update operations for this table.")
+        self._on_load()
+
+
+class FlakyBigQueryClient(FakeBigQueryClient):
+    """Same as FakeBigQueryClient, except load_table_from_json's returned
+    job raises TooManyRequests on its first `raise_count` .result() calls."""
+
+    def __init__(self, *args, raise_count=0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._raise_count = raise_count
+        self._load_attempts = [0]
+
+    def load_table_from_json(self, records, table_ref, job_config=None):
+        def on_load():
+            self.load_calls.append((records, table_ref))
+
+        return FlakyLoadJob(on_load, self._raise_count, self._load_attempts)
+
+
+class TestLoadVaultRecordsRetry:
+    """_load_vault_records: a single load job per chunk can trip BigQuery's
+    per-table write-rate quota (confirmed live: 429 rateLimitExceeded,
+    reason table.write) when many chunks land close together. Must retry
+    with backoff instead of dropping the chunk's data or failing the sync
+    outright on the first rate-limit response."""
+
+    def test_retries_a_rate_limited_load_job_and_still_syncs(self, monkeypatch):
+        monkeypatch.setattr("app.scanners.pii_vault_sync.time.sleep", lambda _seconds: None)
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
+        vault = FakeVault([MANUAL_RESOURCE], {"u1": make_context()})
+        bq = FlakyBigQueryClient(source_rows, raise_count=2)  # fails twice, succeeds on the 3rd attempt
+        job = make_job(bq, vault)
+
+        synced = job.process_chunk("bigquery:proj.dataset.federated_user", ["u1"])
+
+        assert synced == 1
+        assert len(bq.loaded_records) == 1
+        assert bq._load_attempts[0] == 3
+
+    def test_re_raises_once_retries_are_exhausted(self, monkeypatch):
+        monkeypatch.setattr("app.scanners.pii_vault_sync.time.sleep", lambda _seconds: None)
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
+        vault = FakeVault([MANUAL_RESOURCE], {"u1": make_context()})
+        bq = FlakyBigQueryClient(source_rows, raise_count=PiiVaultSyncJob.LOAD_MAX_RETRIES)
+        job = make_job(bq, vault)
+
+        with pytest.raises(TooManyRequests):
+            job.process_chunk("bigquery:proj.dataset.federated_user", ["u1"])
+
+        assert bq._load_attempts[0] == PiiVaultSyncJob.LOAD_MAX_RETRIES
+        assert bq.loaded_records == []  # never actually landed the chunk's data
+
+    def test_does_not_sleep_at_all_when_the_first_attempt_succeeds(self, monkeypatch):
+        sleep_calls = []
+        monkeypatch.setattr("app.scanners.pii_vault_sync.time.sleep", lambda seconds: sleep_calls.append(seconds))
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
+        vault = FakeVault([MANUAL_RESOURCE], {"u1": make_context()})
+        bq = FlakyBigQueryClient(source_rows, raise_count=0)
+        job = make_job(bq, vault)
+
+        synced = job.process_chunk("bigquery:proj.dataset.federated_user", ["u1"])
+
+        assert synced == 1
+        assert sleep_calls == []

@@ -123,6 +123,20 @@ def test_fetch_pii_registry_resource_url_encodes_resource_id(vault_client):
         == "http://mock-vault/pii-registry/resources/bigquery%3Aproject.dataset.table"
     )
 
+def test_mark_resource_synced_posts_the_watermark_to_the_url_encoded_resource(vault_client):
+    mock_res = MagicMock()
+    mock_res.json.return_value = {"resourceId": "bigquery:project.dataset.table", "lastSyncedAt": "2026-08-07T00:00:00+00:00"}
+
+    with patch.object(vault_client.session, 'post', return_value=mock_res) as mock_post:
+        data = vault_client.mark_resource_synced("bigquery:project.dataset.table", "2026-08-07T00:00:00+00:00")
+
+    assert data["lastSyncedAt"] == "2026-08-07T00:00:00+00:00"
+    assert (
+        mock_post.call_args.args[0]
+        == "http://mock-vault/pii-registry/resources/bigquery%3Aproject.dataset.table/mark-synced"
+    )
+    assert mock_post.call_args.kwargs["json"] == {"lastSyncedAt": "2026-08-07T00:00:00+00:00"}
+
 def test_fetch_pii_registry_policy(vault_client):
     mock_res = MagicMock()
     mock_res.json.return_value = {"status": "WARN", "evaluations": []}

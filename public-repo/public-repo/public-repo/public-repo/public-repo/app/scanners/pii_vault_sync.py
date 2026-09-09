@@ -96,13 +96,22 @@ class PiiVaultSyncJob:
     # and keeps each chunk's processing time comfortably under Pub/Sub's
     # 600-second push ack deadline.
     CHUNK_SIZE = 100
-    # A single load job per 100-row chunk, all targeting the one shared
-    # pii_vault table, can trip BigQuery's per-table write-rate quota when
-    # many chunks land close together (confirmed live: 429 rateLimitExceeded,
-    # reason table.write). This self-heals a transient trip within the same
-    # chunk invocation instead of relying solely on Pub/Sub's bare
-    # redelivery (see pii_vault_sync_chunk_worker_push's retry_policy in
-    # chameleon-infra-gcp for the complementary net if this still exhausts).
+    # Streaming inserts (tabledata.insertAll), not load jobs. A load job
+    # per 100-user chunk -- even capped at 20 concurrent writers
+    # (max_instance_request_concurrency=4 * max_instance_count=5, see
+    # chameleon-infra-gcp) -- still tripped BigQuery's per-table LOAD JOB
+    # quota ("too many table update operations for this table") at real
+    # scale (confirmed live against Immoscoop's ~540k-row federated_user
+    # sync, 2026-08-19, even after that concurrency cap was already
+    # tightened once before for the same symptom). Streaming inserts are a
+    # genuinely different BigQuery API with a much higher, purpose-built
+    # quota for exactly this "many small concurrent writes to one table"
+    # shape -- not just a bigger number on the same quota. Safe here
+    # specifically because this table's idempotency is already enforced at
+    # the application layer (_fetch_existing_fields diffs before ever
+    # building a record to write), not by load-job atomicity -- a partial
+    # streaming batch on a crash just gets picked up correctly by the next
+    # chunk run, nothing to lose.
     LOAD_MAX_RETRIES = 5
     LOAD_BASE_BACKOFF_SECONDS = 2
 
@@ -415,14 +424,15 @@ WHERE resource_id = @resource_id
 
     def _load_vault_records(self, records: List[Dict[str, Any]]) -> None:
         table_ref = f"{self.vault_project_id}.{self.vault_dataset_id}.{self.VAULT_TABLE_ID}"
-        job_config = bigquery.LoadJobConfig(
-            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-        )
         for attempt in range(1, self.LOAD_MAX_RETRIES + 1):
             try:
-                load_job = self.bigquery_client.load_table_from_json(records, table_ref, job_config=job_config)
-                load_job.result()
+                errors = self.bigquery_client.insert_rows_json(table_ref, records)
+                if errors:
+                    # Per-row validation errors (e.g. a schema mismatch) --
+                    # distinct from a request-level TooManyRequests below.
+                    # Retrying these would just fail identically, so this is
+                    # a real, non-retryable failure for this chunk.
+                    raise RuntimeError(f"BigQuery streaming insert reported row errors: {errors}")
                 logger.info(f"Synced {len(records)} fields into {table_ref}")
                 return
             except TooManyRequests:
@@ -430,7 +440,7 @@ WHERE resource_id = @resource_id
                     raise
                 delay = self.LOAD_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
                 logger.warning(
-                    f"pii_vault load job rate-limited (attempt {attempt}/{self.LOAD_MAX_RETRIES}), "
+                    f"pii_vault streaming insert rate-limited (attempt {attempt}/{self.LOAD_MAX_RETRIES}), "
                     f"retrying in {delay}s"
                 )
                 time.sleep(delay)

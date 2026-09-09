@@ -42,12 +42,40 @@ def test_pii_vault_sync_enumerates_and_returns_queued_immediately():
     assert body["status"] == "queued"
     assert body["resources_queued"] == 0
     assert body["chunks_queued"] == 0
-    fake_job.sync_all.assert_called_once()
+    fake_job.sync_all.assert_called_once_with(False)
     fake_job.process_chunk.assert_not_called()
     # Constructed with the app-state publisher/topic path, not left unset.
     _, kwargs = job_cls.call_args
     assert kwargs["publisher"] is not None
     assert kwargs["chunk_topic_path"] == "projects/proj/topics/pii-vault-sync-chunks"
+
+
+def test_pii_vault_sync_with_no_body_defaults_force_full_scan_to_false():
+    """The daily Cloud Scheduler call sends no body at all -- must not 400,
+    and must resolve to the same incremental-eligible default as an
+    explicit {"force_full_scan": false}."""
+    fake_job = MagicMock()
+    fake_job.sync_all.return_value = []
+
+    with patch("app.api.discovery.PiiVaultSyncJob", return_value=fake_job):
+        response = TestClient(_make_app()).post("/api/v1/pii-vault-sync", content=b"")
+
+    assert response.status_code == 200
+    fake_job.sync_all.assert_called_once_with(False)
+
+
+def test_pii_vault_sync_force_full_scan_true_is_passed_through():
+    """Sync Now (PiiVaultSyncTrigger) always sends this -- must reach
+    sync_all so it actually bypasses incremental filtering, not just get
+    parsed and dropped."""
+    fake_job = MagicMock()
+    fake_job.sync_all.return_value = []
+
+    with patch("app.api.discovery.PiiVaultSyncJob", return_value=fake_job):
+        response = TestClient(_make_app()).post("/api/v1/pii-vault-sync", json={"force_full_scan": True})
+
+    assert response.status_code == 200
+    fake_job.sync_all.assert_called_once_with(True)
 
 
 def test_pii_vault_sync_chunk_decodes_the_pubsub_envelope_and_calls_process_chunk():

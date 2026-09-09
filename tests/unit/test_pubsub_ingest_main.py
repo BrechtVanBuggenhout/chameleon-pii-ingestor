@@ -197,3 +197,35 @@ def test_verifies_the_token_against_the_requests_own_url_as_audience(monkeypatch
     )
 
     assert captured_audience["value"] == f"https://pubsub-ingest.example.com/pubsub-ingest/{RESOURCE_ID}"
+
+
+def test_audience_is_https_even_when_the_request_itself_arrives_as_http(monkeypatch):
+    """Cloud Run terminates TLS upstream and forwards to the container over
+    plain HTTP -- request.url.scheme is "http" for every real request,
+    even though the real public URL (and the token's real audience) is
+    https. A prior version trusted request.url.scheme directly, producing
+    a computed audience of "http://..." against a real "https://..."
+    token -- every real push failed with a wrong-audience 401 in a
+    permanent retry loop, caught live in a real dev deployment. This test
+    reproduces exactly that scenario: base_url is http, audience must
+    still come out https."""
+    captured_audience = {}
+
+    def _fake_verify(token, audience):
+        captured_audience["value"] = audience
+        return "123"
+
+    monkeypatch.setattr(pubsub_ingest_main, "_verify_push_caller", _fake_verify)
+    pipeline = MagicMock()
+    pipeline.resolve_resource.return_value = FakeResource()
+    pipeline.process_message.return_value = IngestOutcome(accepted=True, reason="ok", fields_written=1)
+
+    TestClient(_make_app(pipeline), base_url="http://pubsub-ingest.example.com").post(
+        f"/pubsub-ingest/{RESOURCE_ID}",
+        json=_push_envelope({"after": {"user_id": "u1", "email": "a@example.com"}}),
+        headers={"Authorization": "Bearer real-token"},
+    )
+
+    assert captured_audience["value"] == f"https://pubsub-ingest.example.com/pubsub-ingest/{RESOURCE_ID}"
+
+    assert captured_audience["value"] == f"https://pubsub-ingest.example.com/pubsub-ingest/{RESOURCE_ID}"

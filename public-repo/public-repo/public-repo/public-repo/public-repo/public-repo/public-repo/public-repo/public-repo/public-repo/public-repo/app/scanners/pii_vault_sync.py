@@ -3,10 +3,12 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
+from google.api_core.exceptions import TooManyRequests
 from google.cloud import bigquery
 
 from app.core.crypto import ChameleonCrypto
@@ -94,6 +96,15 @@ class PiiVaultSyncJob:
     # and keeps each chunk's processing time comfortably under Pub/Sub's
     # 600-second push ack deadline.
     CHUNK_SIZE = 100
+    # A single load job per 100-row chunk, all targeting the one shared
+    # pii_vault table, can trip BigQuery's per-table write-rate quota when
+    # many chunks land close together (confirmed live: 429 rateLimitExceeded,
+    # reason table.write). This self-heals a transient trip within the same
+    # chunk invocation instead of relying solely on Pub/Sub's bare
+    # redelivery (see pii_vault_sync_chunk_worker_push's retry_policy in
+    # chameleon-infra-gcp for the complementary net if this still exhausts).
+    LOAD_MAX_RETRIES = 5
+    LOAD_BASE_BACKOFF_SECONDS = 2
 
     def __init__(
         self,
@@ -381,6 +392,18 @@ WHERE resource_id = @resource_id
             source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
             write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         )
-        load_job = self.bigquery_client.load_table_from_json(records, table_ref, job_config=job_config)
-        load_job.result()
-        logger.info(f"Synced {len(records)} fields into {table_ref}")
+        for attempt in range(1, self.LOAD_MAX_RETRIES + 1):
+            try:
+                load_job = self.bigquery_client.load_table_from_json(records, table_ref, job_config=job_config)
+                load_job.result()
+                logger.info(f"Synced {len(records)} fields into {table_ref}")
+                return
+            except TooManyRequests:
+                if attempt == self.LOAD_MAX_RETRIES:
+                    raise
+                delay = self.LOAD_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    f"pii_vault load job rate-limited (attempt {attempt}/{self.LOAD_MAX_RETRIES}), "
+                    f"retrying in {delay}s"
+                )
+                time.sleep(delay)

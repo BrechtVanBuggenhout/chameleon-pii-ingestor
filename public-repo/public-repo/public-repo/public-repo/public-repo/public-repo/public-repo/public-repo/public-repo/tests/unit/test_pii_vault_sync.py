@@ -129,7 +129,14 @@ class FailingPublisher:
 class FakeVault:
     tenant_id = "acme"
 
-    def __init__(self, registry_resources, contexts, mark_synced_raises=False, mark_sync_attempted_raises=False):
+    def __init__(
+        self,
+        registry_resources,
+        contexts,
+        mark_synced_raises=False,
+        mark_sync_attempted_raises=False,
+        record_outcome_raises=False,
+    ):
         self._registry_resources = registry_resources
         self._contexts = contexts
         self.create_keys_calls: list[list[str]] = []
@@ -137,6 +144,10 @@ class FakeVault:
         self.mark_sync_attempted_calls: list[tuple[str, str]] = []
         self._mark_synced_raises = mark_synced_raises
         self._mark_sync_attempted_raises = mark_sync_attempted_raises
+        self.create_sync_run_calls: list[tuple[str, str | None]] = []
+        self.finalize_sync_run_total_calls: list[tuple[str, int]] = []
+        self.record_chunk_outcome_calls: list[tuple[str, str]] = []
+        self._record_outcome_raises = record_outcome_raises
 
     def fetch_pii_registry_resources(self, owner_connector=None):
         assert owner_connector == "manual"
@@ -157,6 +168,20 @@ class FakeVault:
         if self._mark_sync_attempted_raises:
             raise RuntimeError("Key Vault unreachable")
         self.mark_sync_attempted_calls.append((resource_id, attempted_at_iso))
+
+    def create_sync_run(self, run_id, resource_id=None):
+        self.create_sync_run_calls.append((run_id, resource_id))
+
+    def finalize_sync_run_total(self, run_id, chunks_total):
+        self.finalize_sync_run_total_calls.append((run_id, chunks_total))
+
+    def record_sync_chunk_outcome(self, run_id, outcome):
+        # Real VaultClient.record_sync_chunk_outcome never raises (catches
+        # internally) -- this flag exists only to test process_chunk's own
+        # behavior stays correct even if that contract were ever violated.
+        if self._record_outcome_raises:
+            raise RuntimeError("Key Vault unreachable")
+        self.record_chunk_outcome_calls.append((run_id, outcome))
 
 
 MANUAL_RESOURCE = {
@@ -542,6 +567,61 @@ class TestProcessChunk:
 
         assert synced == 0
         assert bq.queries == []  # never even re-queries a resource that's gone
+
+
+class TestSyncRunProgressReporting:
+    """run_id threading: enumerate_resource's chunk payloads carry it,
+    process_chunk reports completed/failed outcomes with it. None of this
+    is required -- a chunk published with no run_id (the pre-existing
+    behavior, still exercised by TestEnumerateResource/TestProcessChunk
+    above) skips progress reporting entirely."""
+
+    def test_enumerate_resource_includes_run_id_in_published_chunk_payloads(self):
+        source_rows = [{"user_id": "u1", "tenant_id": "acme"}]
+        vault = FakeVault([MANUAL_RESOURCE], {})
+        bq = FakeBigQueryClient(source_rows)
+        publisher = FakePublisher()
+        job = make_job(bq, vault, publisher)
+
+        job.sync_all(run_id="run-abc")
+
+        _, message = publisher.published[0]
+        assert message["run_id"] == "run-abc"
+
+    def test_process_chunk_reports_completed_outcome_on_success(self):
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
+        vault = FakeVault([MANUAL_RESOURCE], {"u1": make_context()})
+        bq = FakeBigQueryClient(source_rows)
+        job = make_job(bq, vault)
+
+        synced = job.process_chunk("bigquery:proj.dataset.federated_user", ["u1"], run_id="run-abc")
+
+        assert synced == 1
+        assert vault.record_chunk_outcome_calls == [("run-abc", "completed")]
+
+    def test_process_chunk_reports_failed_outcome_and_reraises_on_exception(self):
+        vault = FakeVault([MANUAL_RESOURCE], {})
+
+        class ExplodingBigQueryClient:
+            def query(self, *args, **kwargs):
+                raise RuntimeError("BigQuery unavailable")
+
+        job = make_job(ExplodingBigQueryClient(), vault)
+
+        with pytest.raises(RuntimeError, match="BigQuery unavailable"):
+            job.process_chunk("bigquery:proj.dataset.federated_user", ["u1"], run_id="run-abc")
+
+        assert vault.record_chunk_outcome_calls == [("run-abc", "failed")]
+
+    def test_process_chunk_skips_progress_reporting_when_run_id_is_none(self):
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
+        vault = FakeVault([MANUAL_RESOURCE], {"u1": make_context()})
+        bq = FakeBigQueryClient(source_rows)
+        job = make_job(bq, vault)
+
+        job.process_chunk("bigquery:proj.dataset.federated_user", ["u1"])
+
+        assert vault.record_chunk_outcome_calls == []
 
 
 class FlakyLoadJob:

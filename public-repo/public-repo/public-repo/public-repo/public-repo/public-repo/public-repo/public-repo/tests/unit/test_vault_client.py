@@ -147,6 +147,60 @@ def test_fetch_pii_registry_policy(vault_client):
     assert data["status"] == "WARN"
     assert mock_get.call_args.args[0] == "http://mock-vault/pii-registry/policy"
 
+def test_registry_write_headers_empty_when_token_not_configured(monkeypatch):
+    """
+    Without PII_REGISTRY_WRITE_TOKEN set, registry-write calls fall back to
+    whatever the session's default Authorization is (VAULT_API_TOKEN) --
+    which Key Vault's requireWriteAuth rejects with 401. Asserting the
+    headers dict is empty here, rather than asserting a specific 401
+    somewhere downstream, is what actually caught this bug: every
+    registry-write call had silently been sending the wrong token because
+    there was no separate mechanism for this at all.
+
+    Constructs its own client (not the shared `vault_client` fixture) --
+    the env var is only ever read at __init__, so delenv must happen
+    before construction, not just before the assertion.
+    """
+    monkeypatch.delenv("PII_REGISTRY_WRITE_TOKEN", raising=False)
+    client = VaultClient(base_url="http://mock-vault", tenant_id="tenant-a", kms_client=MagicMock())
+    assert client._registry_write_headers == {}
+
+
+def test_mark_resource_synced_sends_the_registry_write_token_header(monkeypatch):
+    monkeypatch.delenv("VAULT_API_TOKEN", raising=False)
+    monkeypatch.setenv("PII_REGISTRY_WRITE_TOKEN", "registry-write-secret")
+    client = VaultClient(base_url="http://mock-vault", tenant_id="tenant-a", kms_client=MagicMock())
+    assert client.session.headers.get("Authorization") is None  # no VAULT_API_TOKEN set in this test
+
+    mock_res = MagicMock()
+    mock_res.json.return_value = {"lastSyncedAt": "2026-08-12T00:00:00+00:00"}
+
+    with patch.object(client.session, "post", return_value=mock_res) as mock_post:
+        client.mark_resource_synced("bigquery:project.dataset.table", "2026-08-12T00:00:00+00:00")
+
+    assert mock_post.call_args.kwargs["headers"] == {"Authorization": "Bearer registry-write-secret"}
+
+
+def test_create_sync_run_sends_the_registry_write_token_header_distinct_from_vault_api_token(monkeypatch):
+    """
+    The registry-write header must override the session's own default
+    Authorization (VAULT_API_TOKEN), not just be present alongside it --
+    Key Vault's requireWriteAuth only ever reads one Authorization header.
+    """
+    monkeypatch.setenv("VAULT_API_TOKEN", "shared-app-secret")
+    monkeypatch.setenv("PII_REGISTRY_WRITE_TOKEN", "registry-write-secret")
+    client = VaultClient(base_url="http://mock-vault", tenant_id="tenant-a", kms_client=MagicMock())
+    assert client.session.headers["Authorization"] == "Bearer shared-app-secret"
+
+    mock_res = MagicMock()
+    mock_res.json.return_value = {"run": {"runId": "run-1"}}
+
+    with patch.object(client.session, "post", return_value=mock_res) as mock_post:
+        client.create_sync_run("run-1", resource_id="bigquery:project.dataset.table")
+
+    assert mock_post.call_args.kwargs["headers"] == {"Authorization": "Bearer registry-write-secret"}
+
+
 def test_report_lineage_error_handling(vault_client):
     """Verifies that lineage reporting logs errors but doesn't crash."""
     with patch.object(vault_client.session, 'post', side_effect=Exception("Network Down")):

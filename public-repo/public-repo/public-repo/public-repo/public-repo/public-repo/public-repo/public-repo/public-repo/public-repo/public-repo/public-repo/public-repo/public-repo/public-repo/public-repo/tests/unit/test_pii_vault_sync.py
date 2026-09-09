@@ -1,5 +1,6 @@
 import base64
 import json
+from datetime import datetime
 
 import pytest
 
@@ -42,10 +43,11 @@ class FakeBigQueryClient:
          job_config, references "pii_vault".
     """
 
-    def __init__(self, source_rows, existing_vault_rows=None, user_id_column="user_id"):
+    def __init__(self, source_rows, existing_vault_rows=None, user_id_column="user_id", updated_at_column="updated_at"):
         self.source_rows = [FakeRow(r) for r in source_rows]
         self.existing_vault_rows = [FakeRow(r) for r in (existing_vault_rows or [])]
         self.user_id_column = user_id_column
+        self.updated_at_column = updated_at_column
         self.queries = []
         self.query_params_log = []
         self.load_calls: list[tuple[list, str]] = []
@@ -61,11 +63,22 @@ class FakeBigQueryClient:
         self.query_params_log.append(params)
 
         if job_config is None:
-            # enumerate_resource: only ever selects the user_id column.
+            # enumerate_resource (full scan): only ever selects the user_id column.
             return FakeQueryJob([FakeRow({self.user_id_column: r[self.user_id_column]}) for r in self.source_rows])
 
         if "pii_vault" in query:
             return FakeQueryJob(self.existing_vault_rows)
+
+        if "last_synced_at" in params:
+            # enumerate_resource (incremental): rows whose own updated_at is
+            # >= the watermark -- mirrors the real >= filter's semantics.
+            # Real bigquery.ScalarQueryParameter(..., "TIMESTAMP", ...)
+            # coerces .value to a datetime, not the original string -- match
+            # that here so comparisons below aren't str-vs-datetime.
+            watermark = params["last_synced_at"]
+            watermark_str = watermark.isoformat() if hasattr(watermark, "isoformat") else str(watermark)
+            matching = [r for r in self.source_rows if str(r.get(self.updated_at_column, "")) >= watermark_str]
+            return FakeQueryJob([FakeRow({self.user_id_column: r[self.user_id_column]}) for r in matching])
 
         # process_chunk's re-query, scoped to the requested user_ids.
         requested_ids = set(params.get("user_ids", []))
@@ -115,10 +128,12 @@ class FailingPublisher:
 class FakeVault:
     tenant_id = "acme"
 
-    def __init__(self, registry_resources, contexts):
+    def __init__(self, registry_resources, contexts, mark_synced_raises=False):
         self._registry_resources = registry_resources
         self._contexts = contexts
         self.create_keys_calls: list[list[str]] = []
+        self.mark_synced_calls: list[tuple[str, str]] = []
+        self._mark_synced_raises = mark_synced_raises
 
     def fetch_pii_registry_resources(self, owner_connector=None):
         assert owner_connector == "manual"
@@ -129,6 +144,11 @@ class FakeVault:
 
     def batch_get_encryption_contexts(self, user_ids):
         return {uid: self._contexts[uid] for uid in user_ids if uid in self._contexts}
+
+    def mark_resource_synced(self, resource_id, synced_at_iso):
+        if self._mark_synced_raises:
+            raise RuntimeError("Key Vault unreachable")
+        self.mark_synced_calls.append((resource_id, synced_at_iso))
 
 
 MANUAL_RESOURCE = {
@@ -141,6 +161,12 @@ MANUAL_RESOURCE = {
         {"name": "email", "classification": "DIRECT_IDENTIFIER", "handling": "ENCRYPT"},
         {"name": "username", "classification": "SYSTEM_IDENTIFIER", "handling": "HASH_SURROGATE"},
     ],
+}
+
+MANUAL_RESOURCE_INCREMENTAL = {
+    **MANUAL_RESOURCE,
+    "updatedAtColumn": "updated_at",
+    "lastSyncedAt": "2026-08-01T00:00:00+00:00",
 }
 
 CHUNK_TOPIC_PATH = "projects/proj/topics/pii-vault-sync-chunks"
@@ -264,6 +290,90 @@ class TestEnumerateResource:
         assert results[0].chunks_queued == 0
         assert results[1].error is None
         assert results[1].chunks_queued == 1
+
+
+class TestIncrementalSync:
+    """Opt-in incremental enumerate_resource: only eligible when both
+    updatedAtColumn and lastSyncedAt are set on the resource, never forced,
+    and only ever advances the watermark after a fully successful run."""
+
+    def test_a_resource_with_no_watermark_fields_keeps_full_scan_and_never_marks_synced(self):
+        source_rows = [{"user_id": "u1", "tenant_id": "acme"}]
+        vault = FakeVault([MANUAL_RESOURCE], {})
+        bq = FakeBigQueryClient(source_rows)
+        job = make_job(bq, vault)
+
+        job.sync_all()
+
+        assert "last_synced_at" not in bq.query_params_log[0]
+        assert vault.mark_synced_calls == []
+
+    def test_eligible_resource_queries_with_the_watermark_filter_and_advances_it(self):
+        source_rows = [
+            {"user_id": "u1", "tenant_id": "acme", "updated_at": "2026-08-05T00:00:00+00:00"},
+        ]
+        vault = FakeVault([MANUAL_RESOURCE_INCREMENTAL], {})
+        bq = FakeBigQueryClient(source_rows)
+        job = make_job(bq, vault)
+
+        job.sync_all()
+
+        # Real bigquery.ScalarQueryParameter(..., "TIMESTAMP", ...) coerces
+        # .value to a parsed datetime, not the original string.
+        assert bq.query_params_log[0]["last_synced_at"].isoformat() == "2026-08-01T00:00:00+00:00"
+        assert ">=" in bq.queries[0]  # not a strict > -- see enumerate_resource's own comment
+        assert len(vault.mark_synced_calls) == 1
+        resource_id, synced_at = vault.mark_synced_calls[0]
+        assert resource_id == "bigquery:proj.dataset.federated_user"
+        # A real ISO8601 timestamp, captured before the query ran (not just
+        # "some string") -- parseable and not the fixture's own old watermark.
+        assert synced_at != "2026-08-01T00:00:00+00:00"
+        datetime.fromisoformat(synced_at)
+
+    def test_a_resource_with_updated_at_column_but_no_prior_watermark_does_one_full_scan_then_sets_it(self):
+        # First-ever sync for a newly-opted-in resource: eligibility requires
+        # BOTH fields, so this still full-scans once, but the watermark gets
+        # established for every subsequent run to filter on.
+        first_time_resource = {**MANUAL_RESOURCE, "updatedAtColumn": "updated_at"}  # no lastSyncedAt yet
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "updated_at": "2020-01-01T00:00:00+00:00"}]
+        vault = FakeVault([first_time_resource], {})
+        bq = FakeBigQueryClient(source_rows)
+        job = make_job(bq, vault)
+
+        results = job.sync_all()
+
+        assert results[0].chunks_queued == 1  # the old row was still picked up -- full scan, not filtered
+        assert "last_synced_at" not in bq.query_params_log[0]
+        assert len(vault.mark_synced_calls) == 1
+
+    def test_force_full_scan_bypasses_incremental_even_when_eligible(self):
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "updated_at": "2020-01-01T00:00:00+00:00"}]
+        vault = FakeVault([MANUAL_RESOURCE_INCREMENTAL], {})
+        bq = FakeBigQueryClient(source_rows)
+        job = make_job(bq, vault)
+
+        results = job.sync_all(force_full_scan=True)
+
+        assert results[0].chunks_queued == 1  # picked up despite predating the watermark
+        assert "last_synced_at" not in bq.query_params_log[0]
+        # A forced-full run still validly covers everything up to its own
+        # start time, and should still advance the watermark -- it correctly
+        # primes the next incremental run rather than leaving it stale.
+        assert len(vault.mark_synced_calls) == 1
+
+    def test_a_watermark_write_failure_does_not_fail_an_otherwise_successful_sync(self):
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "updated_at": "2026-08-05T00:00:00+00:00"}]
+        vault = FakeVault([MANUAL_RESOURCE_INCREMENTAL], {}, mark_synced_raises=True)
+        bq = FakeBigQueryClient(source_rows)
+        job = make_job(bq, vault)
+
+        results = job.sync_all()
+
+        # A real BigQuery scan + Pub/Sub publish already succeeded -- a Key
+        # Vault write hiccup on top of that shouldn't turn into a "sync
+        # failed" result; worst case the next run just re-scans once more.
+        assert results[0].error is None
+        assert results[0].chunks_queued == 1
 
 
 class TestProcessChunk:

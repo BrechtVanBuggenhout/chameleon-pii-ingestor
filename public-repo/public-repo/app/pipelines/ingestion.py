@@ -4,7 +4,6 @@ import os
 import tempfile
 import uuid
 import json
-import base64
 import io
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -191,19 +190,6 @@ class IngestionPipeline:
             self.vault.batch_create_keys(user_ids)
             self.vault.batch_get_encryption_contexts(user_ids)
 
-        def _encrypt_field(context: dict, user_id: str, value: str) -> bytes:
-            """Randomized AES-GCM (fresh nonce per call -- safe to call once
-            per declared field for the same user/DEK, see ingestion pipeline
-            generalization design notes)."""
-            iv = os.urandom(12)
-            raw_bundle_b64 = ChameleonCrypto.encrypt(context['dek'], user_id, value, iv=iv)
-            raw_bundle = base64.b64decode(raw_bundle_b64)
-            ciphertext_only = raw_bundle[12:]
-            iv_b64 = base64.b64encode(iv).decode('utf-8')
-            ciphertext_b64 = base64.b64encode(ciphertext_only).decode('utf-8')
-            encrypted_bundle_str = f"{context['key_id']}:{iv_b64}:{ciphertext_b64}"
-            return encrypted_bundle_str.encode('utf-8')
-
         def process_row(row):
             try:
                 user_id = str(row.get('user_id'))
@@ -226,7 +212,7 @@ class IngestionPipeline:
                         raise ValueError(f"Missing declared PII field '{field_name}' for user {user_id}")
                     value = str(raw_value)
 
-                    field_encrypted_raw = _encrypt_field(context, user_id, value)
+                    field_encrypted_raw = ChameleonCrypto.encrypt_field_bundle(context, user_id, value)
                     # token_key_id (e.g. "chameleon-token-key-v1") is a label, not
                     # key material -- tokenization must use the per-user DEK
                     # directly, same as every other field here, so shredding

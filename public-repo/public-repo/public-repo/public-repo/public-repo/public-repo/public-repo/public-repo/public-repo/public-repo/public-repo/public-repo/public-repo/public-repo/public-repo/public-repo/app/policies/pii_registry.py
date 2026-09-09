@@ -62,6 +62,11 @@ class RegistryResource:
     evidence_pointers: List[str] = field(default_factory=list)
     ghost_data_scan: GhostDataScanConfig = field(default_factory=GhostDataScanConfig)
     registry_version: Optional[str] = None
+    # Opt-in incremental pii_vault sync (see pii_vault_sync.py): both must be
+    # set for a resource to get incremental treatment, otherwise it keeps the
+    # full-scan behavior every other resource has always had.
+    updated_at_column: Optional[str] = None
+    last_synced_at: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RegistryResource":
@@ -93,6 +98,8 @@ class RegistryResource:
                 data.get("ghostDataScan") or data.get("ghost_data_scan")
             ),
             registry_version=data.get("registryVersion") or data.get("registry_version"),
+            updated_at_column=data.get("updatedAtColumn") or data.get("updated_at_column"),
+            last_synced_at=data.get("lastSyncedAt") or data.get("last_synced_at"),
         )
 
     @staticmethod

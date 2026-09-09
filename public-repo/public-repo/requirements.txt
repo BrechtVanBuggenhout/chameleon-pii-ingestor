@@ -12,6 +12,7 @@ aiohttp
 google-cloud-pubsub
 google-cloud-kms
 google-cloud-secret-manager
+google-auth
 snowflake-connector-python
 requests
 cryptography

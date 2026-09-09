@@ -100,8 +100,14 @@ async def pubsub_ingest(resource_id: str, request: Request):
     # the customer's own subscription determines what audience it signs
     # its tokens for (defaulting to the push endpoint URL), so verifying
     # against anything else would be wrong for a dynamic, per-declaration
-    # caller.
-    audience = f"{request.url.scheme}://{request.url.netloc}{request.url.path}"
+    # caller. Scheme is hardcoded to https (same as decrypted-views-decrypt.ts's
+    # `https://${request.hostname}${request.url}`), not read from
+    # request.url.scheme -- Cloud Run terminates TLS upstream and forwards
+    # to the container over plain HTTP, so the app always observes "http"
+    # regardless of the real public scheme. Trusting it produced a live
+    # audience mismatch (token audience "https://...", computed audience
+    # "http://...") that put every real push into a permanent 401 retry loop.
+    audience = f"https://{request.url.netloc}{request.url.path}"
     try:
         verified_sub = await asyncio.to_thread(_verify_push_caller, presented_token, audience)
     except Exception as e:

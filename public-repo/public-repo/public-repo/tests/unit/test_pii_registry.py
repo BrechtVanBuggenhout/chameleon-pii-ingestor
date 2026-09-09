@@ -59,3 +59,48 @@ def test_load_registry_from_key_vault_contract_response():
     assert resource.ghost_data_scan.enabled is True
     assert resource.ghost_data_scan.patterns == ["EMAIL", "PHONE", "NAME"]
     assert resource.direct_identifier_columns[0].handling == "ENCRYPT"
+
+
+class TestSourceRedactionStrategiesResolution:
+    """Mirrors chameleon-key-vault's resolveSourceRedactionStrategies(): the
+    array field wins if present, else the legacy singular field is wrapped
+    (dropping 'NONE'). Must behave identically for the two Firestore-shaped
+    documents pii_vault_sync.py actually receives from the registry API."""
+
+    def _resource(self, **overrides):
+        return {
+            "resourceId": "bigquery:proj.dataset.contacts",
+            "system": "bigquery",
+            "userIdColumn": "user_id",
+            "piiFields": [],
+            **overrides,
+        }
+
+    def test_prefers_the_array_field_when_present(self):
+        registry = PiiMetadataRegistry.from_api_response(
+            {"resources": [self._resource(sourceRedactionStrategies=["REDACT_IN_PLACE", "ENCRYPTED_COPY"])]}
+        )
+        resource = registry.get("bigquery:proj.dataset.contacts")
+        assert resource.source_redaction_strategies == ["REDACT_IN_PLACE", "ENCRYPTED_COPY"]
+        assert resource.wants_encrypted_copy() is True
+
+    def test_falls_back_to_the_legacy_singular_field_dropping_none(self):
+        registry = PiiMetadataRegistry.from_api_response(
+            {"resources": [self._resource(sourceRedactionStrategy="SHADOW_COPY")]}
+        )
+        resource = registry.get("bigquery:proj.dataset.contacts")
+        assert resource.source_redaction_strategies == ["SHADOW_COPY"]
+        assert resource.wants_encrypted_copy() is False
+
+    def test_legacy_none_resolves_to_an_empty_list(self):
+        registry = PiiMetadataRegistry.from_api_response(
+            {"resources": [self._resource(sourceRedactionStrategy="NONE")]}
+        )
+        resource = registry.get("bigquery:proj.dataset.contacts")
+        assert resource.source_redaction_strategies == []
+
+    def test_neither_field_present_resolves_to_an_empty_list(self):
+        registry = PiiMetadataRegistry.from_api_response({"resources": [self._resource()]})
+        resource = registry.get("bigquery:proj.dataset.contacts")
+        assert resource.source_redaction_strategies == []
+        assert resource.wants_encrypted_copy() is False

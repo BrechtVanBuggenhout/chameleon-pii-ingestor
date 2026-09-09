@@ -129,12 +129,14 @@ class FailingPublisher:
 class FakeVault:
     tenant_id = "acme"
 
-    def __init__(self, registry_resources, contexts, mark_synced_raises=False):
+    def __init__(self, registry_resources, contexts, mark_synced_raises=False, mark_sync_attempted_raises=False):
         self._registry_resources = registry_resources
         self._contexts = contexts
         self.create_keys_calls: list[list[str]] = []
         self.mark_synced_calls: list[tuple[str, str]] = []
+        self.mark_sync_attempted_calls: list[tuple[str, str]] = []
         self._mark_synced_raises = mark_synced_raises
+        self._mark_sync_attempted_raises = mark_sync_attempted_raises
 
     def fetch_pii_registry_resources(self, owner_connector=None):
         assert owner_connector == "manual"
@@ -150,6 +152,11 @@ class FakeVault:
         if self._mark_synced_raises:
             raise RuntimeError("Key Vault unreachable")
         self.mark_synced_calls.append((resource_id, synced_at_iso))
+
+    def mark_resource_sync_attempted(self, resource_id, attempted_at_iso):
+        if self._mark_sync_attempted_raises:
+            raise RuntimeError("Key Vault unreachable")
+        self.mark_sync_attempted_calls.append((resource_id, attempted_at_iso))
 
 
 MANUAL_RESOURCE = {
@@ -308,6 +315,10 @@ class TestIncrementalSync:
 
         assert "last_synced_at" not in bq.query_params_log[0]
         assert vault.mark_synced_calls == []
+        # But this resource still genuinely synced -- the separate,
+        # unconditional sync-attempt signal must still advance (see
+        # TestSyncAttemptSignal below).
+        assert len(vault.mark_sync_attempted_calls) == 1
 
     def test_eligible_resource_queries_with_the_watermark_filter_and_advances_it(self):
         source_rows = [
@@ -375,6 +386,60 @@ class TestIncrementalSync:
         # failed" result; worst case the next run just re-scans once more.
         assert results[0].error is None
         assert results[0].chunks_queued == 1
+
+
+class TestSyncAttemptSignal:
+    """lastSyncAttemptAt: advances after every successful enumerate_resource
+    run, regardless of updatedAtColumn/incremental eligibility -- fixes the
+    registry UI permanently showing "Never synced" for a resource that only
+    ever does full scans."""
+
+    def test_advances_for_a_resource_with_no_updatedAtColumn(self):
+        source_rows = [{"user_id": "u1", "tenant_id": "acme"}]
+        vault = FakeVault([MANUAL_RESOURCE], {})
+        bq = FakeBigQueryClient(source_rows)
+        job = make_job(bq, vault)
+
+        job.sync_all()
+
+        assert len(vault.mark_sync_attempted_calls) == 1
+        resource_id, attempted_at = vault.mark_sync_attempted_calls[0]
+        assert resource_id == "bigquery:proj.dataset.federated_user"
+        datetime.fromisoformat(attempted_at)  # a real, parseable ISO8601 timestamp
+
+    def test_advances_alongside_the_incremental_watermark_for_an_eligible_resource(self):
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "updated_at": "2026-08-05T00:00:00+00:00"}]
+        vault = FakeVault([MANUAL_RESOURCE_INCREMENTAL], {})
+        bq = FakeBigQueryClient(source_rows)
+        job = make_job(bq, vault)
+
+        job.sync_all()
+
+        assert len(vault.mark_synced_calls) == 1
+        assert len(vault.mark_sync_attempted_calls) == 1
+
+    def test_a_sync_attempt_write_failure_does_not_fail_an_otherwise_successful_sync(self):
+        source_rows = [{"user_id": "u1", "tenant_id": "acme"}]
+        vault = FakeVault([MANUAL_RESOURCE], {}, mark_sync_attempted_raises=True)
+        bq = FakeBigQueryClient(source_rows)
+        job = make_job(bq, vault)
+
+        results = job.sync_all()
+
+        assert results[0].error is None
+        assert results[0].chunks_queued == 1
+
+    def test_does_not_advance_when_the_resource_has_no_encrypt_fields_or_is_skipped(self):
+        no_encrypt_resource = {**MANUAL_RESOURCE, "piiFields": []}
+        vault = FakeVault([no_encrypt_resource], {})
+        bq = FakeBigQueryClient([{"user_id": "u1", "tenant_id": "acme"}])
+        job = make_job(bq, vault)
+
+        job.sync_all()
+
+        # Skipped before any BigQuery query or Pub/Sub publish -- nothing
+        # was actually attempted, so nothing should be marked attempted.
+        assert vault.mark_sync_attempted_calls == []
 
 
 class TestProcessChunk:

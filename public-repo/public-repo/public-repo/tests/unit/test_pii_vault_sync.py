@@ -677,3 +677,92 @@ class TestLoadVaultRecordsRetry:
 
         assert synced == 1
         assert sleep_calls == []
+
+
+class TestEncryptedCopyWriterWiring:
+    """_sync_chunk -> _append_encrypted_copy: opt-in per resource, best-
+    effort (never fails the chunk's real pii_vault write), reuses the same
+    ciphertext vault_records already computed for this chunk."""
+
+    def test_opted_out_resource_never_calls_the_writer(self):
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
+        vault = FakeVault([MANUAL_RESOURCE], {"u1": make_context()})  # no sourceRedactionStrategies at all
+        bq = FakeBigQueryClient(source_rows)
+        job = make_job(bq, vault)
+        calls = []
+        job.encrypted_copy_writer.append = lambda *args, **kwargs: calls.append(args) or 0
+
+        synced = job.process_chunk("bigquery:proj.dataset.federated_user", ["u1"])
+
+        assert synced == 1
+        assert calls == []
+
+    def test_opted_in_resource_calls_the_writer_once_with_the_chunk_rows_and_vault_records(self):
+        resource = {**MANUAL_RESOURCE, "sourceRedactionStrategies": ["ENCRYPTED_COPY"]}
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
+        vault = FakeVault([resource], {"u1": make_context()})
+        bq = FakeBigQueryClient(source_rows)
+        job = make_job(bq, vault)
+        calls = []
+        job.encrypted_copy_writer.append = lambda res, rows, records: calls.append((res.id, rows, records)) or len(rows)
+
+        synced = job.process_chunk("bigquery:proj.dataset.federated_user", ["u1"])
+
+        assert synced == 1
+        assert len(calls) == 1
+        called_resource_id, called_rows, called_vault_records = calls[0]
+        assert called_resource_id == "bigquery:proj.dataset.federated_user"
+        assert [str(r["user_id"]) for r in called_rows] == ["u1"]
+        assert len(called_vault_records) == 1
+        assert called_vault_records[0]["field_name"] == "email"
+
+    def test_a_resource_combining_redact_in_place_and_encrypted_copy_still_calls_the_writer(self):
+        resource = {**MANUAL_RESOURCE, "sourceRedactionStrategies": ["REDACT_IN_PLACE", "ENCRYPTED_COPY"]}
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
+        vault = FakeVault([resource], {"u1": make_context()})
+        bq = FakeBigQueryClient(source_rows)
+        job = make_job(bq, vault)
+        calls = []
+        job.encrypted_copy_writer.append = lambda *args, **kwargs: calls.append(args) or 0
+
+        job.process_chunk("bigquery:proj.dataset.federated_user", ["u1"])
+
+        assert len(calls) == 1
+
+    def test_does_not_call_the_writer_when_there_is_nothing_new_to_sync(self):
+        # No rows_needing_work -> _sync_chunk returns before vault_records
+        # is even built, so the writer must never be reached either.
+        resource = {**MANUAL_RESOURCE, "sourceRedactionStrategies": ["ENCRYPTED_COPY"]}
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
+        vault = FakeVault([resource], {"u1": make_context()})
+        bq = FakeBigQueryClient(source_rows, existing_vault_rows=[{"user_id": "u1", "field_name": "email"}])
+        job = make_job(bq, vault)
+        calls = []
+        job.encrypted_copy_writer.append = lambda *args, **kwargs: calls.append(args) or 0
+
+        synced = job.process_chunk("bigquery:proj.dataset.federated_user", ["u1"])
+
+        assert synced == 0
+        assert calls == []
+
+    def test_a_writer_failure_does_not_fail_the_chunk_or_lose_the_real_pii_vault_write(self):
+        # Most commonly hit when a resource has just been declared with
+        # ENCRYPTED_COPY but Key Vault's declare-time ensureEncryptedCopyTable()
+        # hasn't created {table}_encrypted_raw yet (or failed to).
+        resource = {**MANUAL_RESOURCE, "sourceRedactionStrategies": ["ENCRYPTED_COPY"]}
+        source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
+        vault = FakeVault([resource], {"u1": make_context()})
+        bq = FakeBigQueryClient(source_rows)
+        job = make_job(bq, vault)
+
+        def _raise(*args, **kwargs):
+            raise RuntimeError('Not found: Table proj:dataset.federated_user_encrypted_raw')
+
+        job.encrypted_copy_writer.append = _raise
+
+        synced = job.process_chunk("bigquery:proj.dataset.federated_user", ["u1"])
+
+        # The real pii_vault write already happened and is unaffected.
+        assert synced == 1
+        assert bq.loaded_table_ref == "proj.chameleon.pii_vault"
+        assert len(bq.loaded_records) == 1

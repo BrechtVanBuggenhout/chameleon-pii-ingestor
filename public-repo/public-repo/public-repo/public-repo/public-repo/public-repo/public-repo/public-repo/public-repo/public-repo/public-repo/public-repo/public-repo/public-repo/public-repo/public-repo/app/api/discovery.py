@@ -79,10 +79,24 @@ async def pii_vault_sync(request: Request):
     mean a client triggering this for a large table (Immoscoop's real
     ~530k users) could give up waiting long before the job actually
     finished, even though the job itself completed correctly server-side.
+
+    Optional JSON body: {"force_full_scan": bool}. The daily Cloud
+    Scheduler call sends no body at all, which defaults to False (so
+    opted-in resources get incremental treatment); Sync Now
+    (PiiVaultSyncTrigger) always sends true, since it's the customer's
+    manual "did I miss something" lever -- an incremental scan wouldn't
+    catch e.g. a newly-declared field on an already-synced resource, which
+    has no concept of "row unchanged, but a field was added."
     """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    force_full_scan = bool(payload.get("force_full_scan", False)) if isinstance(payload, dict) else False
+
     job = _pii_vault_sync_job(request)
 
-    results = await asyncio.to_thread(job.sync_all)
+    results = await asyncio.to_thread(job.sync_all, force_full_scan)
 
     total_chunks = sum(r.chunks_queued for r in results)
     errors = [{"resourceId": r.resource_id, "error": r.error} for r in results if r.error]

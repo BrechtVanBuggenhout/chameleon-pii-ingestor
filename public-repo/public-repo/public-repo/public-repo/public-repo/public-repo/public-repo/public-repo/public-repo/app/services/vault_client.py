@@ -38,6 +38,19 @@ class VaultClient:
         vault_api_token = os.environ.get("VAULT_API_TOKEN")
         if vault_api_token:
             self.session.headers.update({"Authorization": f"Bearer {vault_api_token}"})
+
+        # Separate from VAULT_API_TOKEN above -- the PII registry's own write
+        # routes (mark-synced, mark-sync-attempted, sync-runs/*) are gated by
+        # requireWriteAuth, which checks the Authorization header against
+        # PII_REGISTRY_WRITE_TOKEN independently of the general VAULT_API_KEY
+        # hook (see chameleon-key-vault's pii-registry.ts/sync-runs.ts). Kept
+        # as per-call headers (self._registry_write_headers), not merged into
+        # self.session.headers, since every other call through this session
+        # still needs to authenticate as VAULT_API_TOKEN, not this token.
+        registry_write_token = os.environ.get("PII_REGISTRY_WRITE_TOKEN")
+        self._registry_write_headers: Dict[str, str] = (
+            {"Authorization": f"Bearer {registry_write_token}"} if registry_write_token else {}
+        )
         retry_strategy = Retry(
             total=5,
             backoff_factor=1,
@@ -304,9 +317,46 @@ class VaultClient:
         """
         encoded_resource_id = quote(resource_id, safe="")
         url = f"{self.base_url}/pii-registry/resources/{encoded_resource_id}/mark-synced"
-        res = self.session.post(url, json={"lastSyncedAt": synced_at_iso})
+        res = self.session.post(url, json={"lastSyncedAt": synced_at_iso}, headers=self._registry_write_headers)
         res.raise_for_status()
         return res.json()
+
+    def create_sync_run(self, run_id: str, resource_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Registers a new sync_runs doc in Key Vault before any chunk for this
+        run can possibly be processed -- see pii_vault_sync.py's sync_all/
+        sync_one for why the total isn't known yet at this point (it must be
+        created before enumeration, not after, to avoid a race where a fast
+        chunk finishes before the run itself exists).
+        """
+        body: Dict[str, Any] = {"runId": run_id, "tenantId": self.tenant_id}
+        if resource_id:
+            body["resourceId"] = resource_id
+        url = f"{self.base_url}/pii-registry/sync-runs"
+        res = self.session.post(url, json=body, headers=self._registry_write_headers)
+        res.raise_for_status()
+        return res.json()
+
+    def finalize_sync_run_total(self, run_id: str, chunks_total: int) -> Dict[str, Any]:
+        """Called once enumeration finishes and the real chunk count is known."""
+        url = f"{self.base_url}/pii-registry/sync-runs/{run_id}/finalize-total"
+        res = self.session.post(url, json={"chunksTotal": chunks_total}, headers=self._registry_write_headers)
+        res.raise_for_status()
+        return res.json()
+
+    def record_sync_chunk_outcome(self, run_id: str, outcome: str) -> None:
+        """
+        Best-effort per-chunk progress report from process_chunk. Never
+        raises on a Key Vault-side failure -- a progress bar going stale is
+        vastly preferable to a real chunk sync failing because progress
+        reporting hiccuped.
+        """
+        try:
+            url = f"{self.base_url}/pii-registry/sync-runs/{run_id}/progress"
+            res = self.session.post(url, json={"outcome": outcome}, headers=self._registry_write_headers)
+            res.raise_for_status()
+        except Exception as e:
+            logger.warning(f"Failed to record sync run progress for {run_id}: {e}")
 
     def mark_resource_sync_attempted(self, resource_id: str, attempted_at_iso: str) -> Dict[str, Any]:
         """
@@ -320,7 +370,7 @@ class VaultClient:
         """
         encoded_resource_id = quote(resource_id, safe="")
         url = f"{self.base_url}/pii-registry/resources/{encoded_resource_id}/mark-sync-attempted"
-        res = self.session.post(url, json={"lastSyncAttemptAt": attempted_at_iso})
+        res = self.session.post(url, json={"lastSyncAttemptAt": attempted_at_iso}, headers=self._registry_write_headers)
         res.raise_for_status()
         return res.json()
 

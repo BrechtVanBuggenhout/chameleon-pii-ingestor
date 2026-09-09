@@ -23,6 +23,18 @@ from app.scanners.warehouse_metadata_crawler import normalize_bigquery_resource_
 
 logger = logging.getLogger(__name__)
 
+
+class _HealthCheckLogFilter(logging.Filter):
+    """Drops uvicorn's access-log line for /health -- hit continuously by
+    Cloud Run's own health probes, not real traffic, and drowns out real
+    request logs in prod."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/health" not in record.getMessage()
+
+
+logging.getLogger("uvicorn.access").addFilter(_HealthCheckLogFilter())
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Initialize the services and start the GCS monitor background task

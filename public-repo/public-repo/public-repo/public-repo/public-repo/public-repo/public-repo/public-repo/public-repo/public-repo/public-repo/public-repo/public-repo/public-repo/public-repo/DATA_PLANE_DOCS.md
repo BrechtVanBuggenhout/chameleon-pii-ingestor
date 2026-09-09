@@ -1,154 +1,75 @@
 # Project Chameleon: Data Plane Documentation
 
+*Refreshed 2026-08-09. Previous version (2026-06-04) described "Phase 4: Janitor Loop" as the latest milestone — that component (`app/api/janitor.py`, the `/shred` webhook, `saas_sinks.py`) has since been removed entirely (2026-07-21): nothing in production ever called it, its HubSpot connector was mock-only, and its Salesforce connector duplicated the real, working one on the Key Vault side. Real SaaS-cascade wipes go through `chameleon-key-vault`'s `janitor.ts` directly. This doc describes what's actually here now.*
+
 ## 1. Executive Summary
-The `chameleon-data-pipelines` repository serves as the **Data Plane** for Project Chameleon. While the Control Plane (Node.js Vault) manages keys and policy, this repository provides the execution engine responsible for secure data ingestion, lineage instrumentation, and automated compliance enforcement (The Janitor).
 
-Its primary mission is to ensure that PII (Personally Identifiable Information) is never stored in plaintext and that every piece of data can be programmatically "shredded" across all downstream systems upon request.
+`chameleon-data-pipelines` is the **Data Plane** for Project Chameleon — the execution engine for ingestion, PII discovery/scanning, and the `pii_vault` sync job. The Control Plane (`chameleon-key-vault`) owns keys, policy, the registry, and deletion orchestration; this repo does the actual data movement and warehouse-side work the Control Plane triggers.
 
-## 2. Core Architecture & Workflow
-The repository is organized into three distinct operational pillars:
+## 2. Core Components (`app/`)
 
-### A. Secure Ingestion Pipeline (`app/pipelines/ingestion.py`)
-This is the entry point for all raw data.
-1.  **Detection:** Monitors GCS landing zones for new CSV/JSON files.
-2.  **Policy Fetch:** For every record/batch, it fetches an `EncryptionContext` from the Vault.
-3.  **Local Encryption:** Uses **Randomized AES-256-GCM** for PII and generates deterministic **HMAC-SHA256 tokens** for joins and deduplication, as defined by the policy.
-4.  **Warehouse Loading:** Batches encrypted records into BigQuery (`stg_users`) using high-performance JSON-stream loading.
+| Directory | Role |
+|---|---|
+| `pipelines/ingestion.py` | GCS landing-zone → Vault (get DEK) → local encrypt → BigQuery `stg_users` load |
+| `scanners/pii_vault_sync.py` | Syncs declared "manual" resources into the central `pii_vault` table. Incremental as of 2026-08-07 — watermark-filtered for resources with `updated_at_column` set, full-scan otherwise. Force-full-scan available for Sync Now. |
+| `scanners/ghost_data_scanner.py` | Scans for PII-looking data that isn't declared in the registry |
+| `scanners/warehouse_metadata_crawler.py` | Crawls warehouse schema for discovery |
+| `policies/pii_registry.py` | `RegistryResource` model + parsing — the Data Plane's view of what Key Vault's registry declares |
+| `policies/dbt_policy.py` | dbt-sourced policy/registry slice |
+| `api/discovery.py` | Current FastAPI router — `/pii-vault-sync`, `/pii-vault-sync-chunk` (Pub/Sub push target for fan-out), discovery endpoints |
+| `api/source_staleness.py` | BYOC self-built-image staleness check (2026-08-06) — compares a customer's built commit SHAs against Chameleon's public repos, logs a warning to their own Cloud Logging only |
+| `services/vault_client.py` | HTTP client to Key Vault — registry fetch, `mark_resource_synced`, encryption context |
+| `services/{bigquery,gcs,snowflake}_client.py` | Warehouse/storage clients |
+| `services/warehouse_factory.py` | Picks the right warehouse client (BigQuery vs. Snowflake) per resource |
+| `services/gcs_monitor.py` | Watches for new landing-zone files; deletes the source file on successful processing (the published `DATA_READ` lineage event is the durable record — no permanent plaintext copy left behind) |
+| `core/crypto.py` | Randomized AES-256-GCM + HMAC-SHA256 tokenization |
+| `core/signature_verifier.py` | Verifies signed requests from the Control Plane |
 
-### B. Active Lineage Tracking
-Every component is instrumented to report immutable lineage events to the Control Plane.
--   **Read Events:** Logged when data is pulled from GCS.
--   **Ingestion Events:** Logged when data is committed to BigQuery.
--   **Cascade Events:** Logged when data is deleted from downstream SaaS systems.
+## 3. What's real vs. what the old doc described as current
 
-### C. The Janitor Loop (`app/api/janitor.py`)
-The Janitor is an execution engine for signed shredding requests.
-1.  **Verification:** Validates the signature of the shred request from the Control Plane.
-2.  **Cascade Wipe:** Issues authenticated delete requests to external systems (HubSpot, Salesforce) via a connector architecture.
-3.  **Reporting:** Emits status events back to the Control Plane for each destination attempt.
-4.  **Resilience:** Implements exponential backoff and routes permanent failures to a **Dead Letter Queue (DLQ)**.
+- **No Janitor, no `/shred` endpoint in this repo.** Removed 2026-07-21. If you're looking for SaaS-cascade wipe logic, it's in `chameleon-key-vault/src/services/janitor.ts` now, not here.
+- **`pii_vault_sync.py` is the actual center of gravity now**, not ingestion alone — most of what this service does day-to-day is the daily/incremental sync job, triggered either by Cloud Scheduler (incremental-eligible) or Sync Now from the console (always forced full scan).
+- **Snowflake support exists** (`snowflake_client.py`, `warehouse_factory.py`) — the old doc only described BigQuery.
+- **Source staleness check** (`source_staleness.py`) is new BYOC-specific functionality with no equivalent in the old doc at all.
 
-## 3. Key Technical Achievements
+## 4. Data Flow: Sync (the primary flow now)
 
-### Modern Crypto Implementation
-Implementation of randomized AES-256-GCM with per-record IVs. The system now attaches `encryption_version` and `key_id` to every record, ensuring long-term rotatability and security of PII.
-
-### High-Performance Vault Client
-A custom `VaultClient` featuring:
--   **Thread-safe Context Caching:** Caches encryption metadata (keys, versions, tokenization rules) to minimize latency.
--   **Robust Retries:** Uses `urllib3` retry strategies to handle transient 429 (Rate Limit) or 5xx errors from the security infrastructure.
-
-### Reliability Engineering
-The Janitor loop is designed for "Compliance Grade" reliability:
--   **Async Processing:** Uses FastAPI BackgroundTasks to ensure shredding webhooks return immediately while the heavy lifting happens in the background.
--   **Auditability:** Every successful and failed wipe produces a receipt ID and a lineage event, creating a verifiable "Certificate of Destruction."
-
-## 4. Integration with Project Chameleon
-
-### 4.1. Data Flow Sequence Diagram
-
-```mermaid
-sequenceDiagram
-    participant GCS as GCS Landing Zone
-    participant DP as Data Plane (Ingestion Pipeline)
-    participant Vault as Vault (Control Plane)
-    participant BQ as BigQuery (stg_users)
-    participant Janitor as Janitor (Data Plane API)
-    participant Lineage as Vault (Lineage Service)
-    participant HubSpot as HubSpot (Mock)
-    participant Salesforce as Salesforce (Mock)
-    participant DLQ as Pub/Sub DLQ
-
-    rect rgb(230, 255, 230)
-        box Green Ingestion Flow
-        GCS->>DP: New CSV/JSON file detected (source_uri)
-        activate DP
-        DP->>Vault: get_or_create_key(userId)
-        activate Vault
-        Vault-->>DP: DEK (cached)
-        deactivate Vault
-        DP->>DP: Encrypt PII (Randomized GCM) + Generate Tokens (HMAC)
-        DP->>Vault: report_lineage(GCS -> Pipeline, READ)
-        activate Vault
-        Vault-->>DP: Lineage ACK
-        deactivate Vault
-        DP->>BQ: load_records(encrypted_data)
-        activate BQ
-        BQ-->>DP: Load ACK
-        deactivate BQ
-        DP->>Vault: report_lineage(Pipeline -> BQ, INGESTION)
-        activate Vault
-        Vault-->>DP: Lineage ACK
-        deactivate Vault
-        deactivate DP
-        end
-    end
-
-    rect rgb(255, 240, 230)
-        box Red Shredding Flow
-        Vault->>Janitor: POST /shred (userId)
-        activate Janitor
-        Janitor->>Lineage: search_lineage(userId)
-        activate Lineage
-        Lineage-->>Janitor: destinations=["hubspot", "salesforce"]
-        deactivate Lineage
-
-        alt HubSpot Wipe
-            Janitor->>HubSpot: delete_contact(userId)
-            activate HubSpot
-            HubSpot-->>Janitor: {"status": "success", "receipt_id": "hs-..."}
-            deactivate HubSpot
-        else Salesforce Wipe (with retry)
-            Janitor->>Salesforce: delete_lead(userId) (Attempt 1)
-            activate Salesforce
-            Salesforce--xJanitor: Error (e.g., 500)
-            Janitor->>Janitor: Wait (exponential backoff)
-            Janitor->>Salesforce: delete_lead(userId) (Attempt 2)
-            Salesforce--xJanitor: Error (e.g., 500)
-            Janitor->>Janitor: Wait (exponential backoff)
-            Janitor->>Salesforce: delete_lead(userId) (Attempt 3)
-            Salesforce--xJanitor: Error (e.g., 500)
-            deactivate Salesforce
-            Janitor->>DLQ: publish_failed_wipe(userId, "salesforce", error)
-            activate DLQ
-            DLQ-->>Janitor: Publish ACK
-            deactivate DLQ
-        end
-
-        Janitor->>Vault: report_lineage(Janitor -> SaaS Sinks, CASCADE_WIPE_COMPLETE)
-        activate Vault
-        Vault-->>Janitor: Lineage ACK
-        deactivate Vault
-        deactivate Janitor
-        end
-    end
+```
+Cloud Scheduler (daily, no body) or console "Sync Now" (force_full_scan=true)
+  → POST /pii-vault-sync
+  → PiiVaultSyncJob.sync_all(force_full_scan)
+     → for each declared resource:
+        - incremental eligible (updated_at_column + last_synced_at set, not forced)?
+          → WHERE updated_at_column >= last_synced_at
+        - else: full population scan
+     → enumerate → fan out via Pub/Sub (pii-vault-sync-chunks) → process_chunk per batch
+     → on success: POST back to Key Vault's /pii-registry/resources/:id/mark-synced
 ```
 
-| Component | Role in Chameleon | Interaction with this Repo |
-| :--- | :--- | :--- |
-| **Control Plane (Node Vault)** | Key Management & Policy | Provides DEKs; Triggers the `/shred` webhook. |
-| **BigQuery** | Data Warehouse | Destination for encrypted PII and Lineage logs. |
-| **GCS** | Landing Zone | Source for raw data ingestion. |
-| **Cloud KMS** | Root of Trust | Backs the encryption used by the Data Plane. |
-| **Pub/Sub** | Error Handling | Acts as the DLQ for failed Janitor tasks. |
+## 5. Data Flow: Ingestion (unchanged in shape from the old doc)
 
-## 5. Repository Structure
+```
+GCS landing zone → detect new file → fetch EncryptionContext from Vault
+  → local encrypt (randomized AES-256-GCM) + HMAC tokenize
+  → batch load to BigQuery stg_users
+  → report lineage (READ, then INGESTION events)
+  → delete the source landing-zone file (lineage event is the durable record)
+```
+
+## 6. Repository Structure (current)
 
 ```text
 app/
-├── api/            # FastAPI routers (Janitor webhooks)
-├── core/           # Cryptographic primitives (Deterministic AES)
-├── pipelines/      # Ingestion logic (GCS -> Vault -> BQ)
-├── services/       # Clients for Vault, BQ, GCS, and SaaS Mocks
-└── config.py       # Environment-driven settings
-scripts/            # Utility scripts for dry-run testing
-tests/              # Unit tests for crypto and pipeline resilience
+├── api/            # discovery.py (pii-vault-sync), source_staleness.py
+├── core/           # crypto, signature verification
+├── pipelines/       # ingestion
+├── policies/        # pii_registry.py, dbt_policy.py
+├── scanners/        # pii_vault_sync.py, ghost_data_scanner.py, warehouse_metadata_crawler.py
+├── services/        # vault_client, bigquery/gcs/snowflake clients, warehouse_factory, gcs_monitor
+└── config.py
+tests/unit/          # pytest suite
 ```
 
-## 6. How to Use
-Detailed setup and testing instructions are located in `TESTING.md`. The pipeline expects a running instance of the Chameleon Vault and appropriate GCP credentials configured via `Application Default Credentials (ADC)`.
+## 7. How to Use
 
----
-*Last Updated: 2026-06-04*
-*Status: Phase 4 (Janitor Loop) Integration Complete*
-```
+See `TESTING.md` for setup and test instructions (also refreshed 2026-08-09 — the old Janitor-based manual testing steps have been removed). `stress_test.md` covers scale testing.

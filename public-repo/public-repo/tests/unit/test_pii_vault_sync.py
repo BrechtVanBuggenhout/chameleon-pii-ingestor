@@ -640,7 +640,7 @@ class TestLoadVaultRecordsRetry:
     data or failing the sync outright on the first rate-limit response."""
 
     def test_retries_a_rate_limited_load_job_and_still_syncs(self, monkeypatch):
-        monkeypatch.setattr("app.scanners.pii_vault_sync.time.sleep", lambda _seconds: None)
+        monkeypatch.setattr("app.services.bigquery_streaming_insert.time.sleep", lambda _seconds: None)
         source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
         vault = FakeVault([MANUAL_RESOURCE], {"u1": make_context()})
         bq = FlakyBigQueryClient(source_rows, raise_count=2)  # fails twice, succeeds on the 3rd attempt
@@ -653,7 +653,7 @@ class TestLoadVaultRecordsRetry:
         assert bq._load_attempts[0] == 3
 
     def test_re_raises_once_retries_are_exhausted(self, monkeypatch):
-        monkeypatch.setattr("app.scanners.pii_vault_sync.time.sleep", lambda _seconds: None)
+        monkeypatch.setattr("app.services.bigquery_streaming_insert.time.sleep", lambda _seconds: None)
         source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
         vault = FakeVault([MANUAL_RESOURCE], {"u1": make_context()})
         bq = FlakyBigQueryClient(source_rows, raise_count=PiiVaultSyncJob.LOAD_MAX_RETRIES)
@@ -667,7 +667,7 @@ class TestLoadVaultRecordsRetry:
 
     def test_does_not_sleep_at_all_when_the_first_attempt_succeeds(self, monkeypatch):
         sleep_calls = []
-        monkeypatch.setattr("app.scanners.pii_vault_sync.time.sleep", lambda seconds: sleep_calls.append(seconds))
+        monkeypatch.setattr("app.services.bigquery_streaming_insert.time.sleep", lambda seconds: sleep_calls.append(seconds))
         source_rows = [{"user_id": "u1", "tenant_id": "acme", "email": "u1@example.com"}]
         vault = FakeVault([MANUAL_RESOURCE], {"u1": make_context()})
         bq = FlakyBigQueryClient(source_rows, raise_count=0)
